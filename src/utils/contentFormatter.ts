@@ -7,6 +7,104 @@
  * 3. Handles "Smart Line Breaks" (keeping paragraphs, merging wrap-lines).
  */
 
+// ============================================================================
+// BRANDED TYPE: Single "MathText input contract" (Recommendation 8)
+// ============================================================================
+
+/**
+ * Branded type representing text that has been fully formatted and is safe
+ * to render in MathText without additional processing.
+ *
+ * This type establishes a contract: any string passed to MathText should
+ * be a FormattedMathString, guaranteeing it has been through the
+ * canonical formatting pipeline.
+ */
+export type FormattedMathString = string & { __brand: "FormattedMathString" };
+
+// ============================================================================
+// CONTENT-KIND ROUTING: Route content to appropriate formatters
+// ============================================================================
+
+import type { ContentKind } from "../types/homework";
+
+/**
+ * Detect the content kind of a string to route it to the appropriate formatter.
+ * This prevents math-specific transforms from mangling non-math content.
+ *
+ * @param text - The text to classify
+ * @returns ContentKind - "math", "prose", "list", or "code"
+ */
+export function detectContentKind(text?: string): ContentKind {
+  const t = (text ?? "").trim();
+  if (!t) return "prose";
+
+  // Multiple choice / ordered list patterns (A. or A) or 1) or - bullet)
+  if (/^[A-Da-d]\.\s/m.test(t) || /^\d+\)\s/m.test(t) || /^-\s+/m.test(t)) {
+    return "list";
+  }
+
+  // Code-ish (triple backticks or ends with semicolon/brace)
+  if (t.includes("```") || /;\s*$/.test(t) || /\{\s*$/.test(t)) {
+    return "code";
+  }
+
+  // Math-ish markers: equations, fractions, color tags, superscripts, subscripts, arrows
+  if (
+    t.includes("=") ||
+    /\{[^}]*\/[^}]*\}/.test(t) ||  // {a/b} fraction syntax
+    /\[[a-z]+:/.test(t) ||          // [red:...] color tags
+    /\^/.test(t) ||                 // superscripts
+    /_\d/.test(t) ||                // subscripts like x_1
+    t.includes("→")
+  ) {
+    return "math";
+  }
+
+  return "prose";
+}
+
+/**
+ * Format content by its kind, routing to the appropriate formatter.
+ * This is the primary entry point for content-aware formatting.
+ *
+ * - math: Full equation pipeline (fractions, labels, line joining, etc.)
+ * - list: Preserve list structure, minimal transforms
+ * - code: Preserve whitespace exactly
+ * - prose: Clean whitespace, no math transforms
+ *
+ * @param input - The text to format
+ * @param kind - The content kind
+ * @returns Formatted string
+ */
+export function formatByKind(input: string, kind: ContentKind): string {
+  const text = normalizeLineBreaks(input ?? "").trim();
+  if (!text) return "";
+
+  if (kind === "math") {
+    // Full equation pipeline (existing formatEquationText)
+    return formatEquationText(text);
+  }
+
+  if (kind === "list") {
+    // Preserve list structure; avoid math transforms that collapse newlines
+    // Just normalize excessive newlines
+    return text
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  if (kind === "code") {
+    // Absolutely minimal: preserve whitespace, just normalize line endings
+    return (input ?? "").replace(/\r\n/g, "\n");
+  }
+
+  // prose: clean whitespace, no math transforms
+  return text
+    .replace(/[ \t]+\n/g, "\n")    // Remove trailing spaces on lines
+    .replace(/\n{3,}/g, "\n\n")    // Collapse excessive newlines
+    .trim();
+}
+
 /**
  * CRITICAL: Normalize all line break types to standard \n
  * Handles:
@@ -23,6 +121,83 @@ export function normalizeLineBreaks(text: string): string {
 }
 
 /**
+ * CRITICAL FIX 1: Strip markdown emphasis markers (*x*) before ANY math formatting.
+ * This prevents asterisks from being confused with multiplication or leaking into rendered output.
+ *
+ * Examples:
+ *   "*x*" → "x"
+ *   "**x**" → "x"
+ *   "*[blue:x]*" → "[blue:x]"
+ *   "*abc*" → "abc"
+ */
+export function stripMarkdownEmphasis(text: string): string {
+  if (!text) return "";
+
+  let out = text;
+
+  // Handle **bold** patterns first (double asterisks)
+  out = out.replace(/\*\*([A-Za-z0-9_]+)\*\*/g, "$1");
+
+  // Handle *[color:content]* patterns (color-tagged variables wrapped in asterisks)
+  out = out.replace(/\*(\[(?:red|blue|green|orange|purple|yellow|teal|indigo|pink):[^\]]+\])\*/gi, "$1");
+
+  // Then handle plain *token* patterns (single letters or words)
+  // This removes the asterisks from italic markers like *x*, *abc*, *variable*
+  out = out.replace(/\*([A-Za-z][A-Za-z0-9_]*)\*/g, "$1");
+
+  return out;
+}
+
+/**
+ * CRITICAL FIX 1b: Strip dangling asterisks that appear at the end of tokens.
+ * These are fragments left over from malformed *x* patterns that got partially processed.
+ *
+ * Examples:
+ *   "x*" → "x" (when followed by whitespace/end/punctuation)
+ *   "}*" → "}" (common after fraction closes)
+ *   "× x*" → "× x"
+ */
+export function stripDanglingAsterisks(text: string): string {
+  if (!text) return "";
+
+  // Remove trailing asterisk after alphanumeric or closing brace when followed by
+  // whitespace, end of string, or common punctuation
+  return text.replace(/([A-Za-z0-9_}])\*(?=\s|$|[)\].,;:+\-×÷=])/g, "$1");
+}
+
+/**
+ * MASTER FUNCTION: Normalize all asterisk usage in text.
+ * This should be called at the VERY START of all formatting pipelines.
+ *
+ * Combines:
+ * 1. Strip markdown emphasis (*x*, **x**)
+ * 2. Strip dangling asterisks (x*, }*)
+ * 3. Remove duplicated variable tokens caused by asterisk bugs (x x)
+ *
+ * This single function eliminates all asterisk-related corruption before any other processing.
+ */
+export function normalizeAsterisks(text: string): string {
+  if (!text) return "";
+
+  let out = text;
+
+  // Step 1: Strip markdown bold/italic emphasis
+  out = out.replace(/\*\*([A-Za-z0-9_]+)\*\*/g, "$1");
+  out = out.replace(/\*(\[(?:red|blue|green|orange|purple|yellow|teal|indigo|pink):[^\]]+\])\*/gi, "$1");
+  out = out.replace(/\*([A-Za-z][A-Za-z0-9_]*)\*/g, "$1");
+
+  // Step 2: Strip dangling asterisks after tokens
+  out = out.replace(/([A-Za-z0-9_}])\*(?=\s|$|[)\].,;:+\-×÷=])/g, "$1");
+
+  // Step 3: Remove duplicated single-letter variables caused by asterisk corruption
+  // Pattern: "x x" where the same letter appears twice with just whitespace between
+  // This catches corruption like "× x x" from "× *x* x" or similar
+  out = out.replace(/\b([A-Za-z])\s+\1\b/g, "$1");
+
+  return out;
+}
+
+/**
  * CRITICAL: Disambiguate asterisks that serve two purposes:
  * 1. Italics delimiter: *x*, *variable*
  * 2. Multiplication: {3/4}*8, 2*x*, etc.
@@ -35,8 +210,12 @@ type MaskMap = { text: string; map: Record<string, string> };
 
 /**
  * Mask italic tokens (*letter...*) so they aren't confused with multiplication asterisks.
- * Only treats *...* as italics when content contains letters (avoids "*8" being treated as italic).
+ * Only treats *...* as italics when content starts with a letter.
  * Examples masked: *x*, *abc*, *x2*, *PE_spring*
+ *
+ * CRITICAL: Each placeholder MUST be unique to prevent map overwrites and token leakage.
+ * The placeholder format (IMASK#IMASK) starts with a letter so the multiplication regex
+ * can properly "see" it as a valid left operand context.
  */
 function maskItalicsTokens(input: string): MaskMap {
   const map: Record<string, string> = {};
@@ -45,7 +224,9 @@ function maskItalicsTokens(input: string): MaskMap {
   // Match *content* where content starts with a letter and may contain letters, digits, underscores
   // This covers variables like *x*, *PE_spring*, *v_0*, etc.
   const text = input.replace(/\*([a-zA-Z][a-zA-Z0-9_]*)\*/g, (match) => {
-    const key = `<<ITALIC_${i++}>>`;
+    // MUST be unique per match; MUST start with a letter so the existing
+    // times-regex can properly recognize it as an operand context
+    const key = `IMASK${i++}IMASK`;
     map[key] = match; // Keep original including asterisks
     return key;
   });
@@ -55,12 +236,118 @@ function maskItalicsTokens(input: string): MaskMap {
 
 /**
  * Restore masked tokens back to their original form.
+ * Replaces in longest-key-first order to handle any nested scenarios safely.
  */
 function unmaskTokens(input: string, map: Record<string, string>): string {
   let out = input;
-  for (const key of Object.keys(map)) {
+
+  // Replace in stable order (longest-first is a safe habit if key schemes ever change)
+  const keys = Object.keys(map).sort((a, b) => b.length - a.length);
+  for (const key of keys) {
     out = out.split(key).join(map[key]);
   }
+
+  return out;
+}
+
+// ============================================================================
+// FINALIZATION: Prevent internal formatting artifacts from leaking to output
+// ============================================================================
+
+/**
+ * Known internal placeholder/marker patterns that should NEVER appear in final output.
+ * These are used during formatting pipeline and must be stripped before rendering.
+ */
+const FORMAT_LEAK_REGEXES: RegExp[] = [
+  /\bIMASK\d+IMASK\b/g,           // Italic masking tokens
+  /\bMASK\d+\b/g,                  // Generic mask tokens
+  /\b_MASK\d+_?\b/g,               // Underscore-wrapped mask tokens
+  /\bPLACEHOLDER[_\d]+\b/g,        // Placeholder tokens
+  /XXIMAGEPROTECTED\d*XX/g,        // Image protection tokens
+  /〔PROTECTED\d+〕/g,              // Unicode-bracket protected tokens
+  /\bLIST_BREAK\b/g,               // List break markers
+  /⟪STEP⟫/g,                       // Step boundary markers
+  /<<ITALIC_\d+>>/g,               // Legacy italic tokens (if any remain)
+  /__FILE_URL_\d+__/g,             // File URL placeholders
+];
+
+/**
+ * Strip all known internal formatting artifacts from text.
+ * This is the defensive cleanup that catches any tokens that escaped unmask steps.
+ */
+function stripInternalArtifacts(text: string): string {
+  let out = text;
+
+  for (const rx of FORMAT_LEAK_REGEXES) {
+    // Reset lastIndex for global regexes before use
+    rx.lastIndex = 0;
+    out = out.replace(rx, "");
+  }
+
+  // Clean up any whitespace damage caused by stripping tokens
+  out = out
+    .replace(/[ \t]+\n/g, "\n")      // Trailing whitespace before newlines
+    .replace(/\n{3,}/g, "\n\n")      // Excessive newlines
+    .replace(/[ \t]{2,}/g, " ")      // Multiple spaces
+    .trim();
+
+  return out;
+}
+
+/**
+ * Development-only assertion to detect formatting leakage.
+ * In DEV mode: throws an error to help catch issues early during development.
+ * In PROD mode: silently continues (defensive - don't crash the app).
+ *
+ * CRITICAL: This is part of the "format once, render only" contract enforcement.
+ * If this throws, it means internal markers leaked through the formatting pipeline.
+ */
+function assertNoInternalArtifacts(text: string, context: string): void {
+  // Only run in development - use typeof check for React Native compatibility
+  const isDev = typeof __DEV__ !== "undefined" ? __DEV__ : false;
+  if (!isDev) return;
+
+  for (const rx of FORMAT_LEAK_REGEXES) {
+    rx.lastIndex = 0;
+    if (rx.test(text)) {
+      rx.lastIndex = 0;
+      // Find the actual leaked token for better error message
+      const match = text.match(rx);
+      const leakedToken = match ? match[0] : rx.source;
+
+      // CRITICAL: Throw in DEV to enforce the formatting contract
+      // This ensures developers catch leakage issues immediately
+      throw new Error(
+        `[contentFormatter] FORMATTING CONTRACT VIOLATION in ${context}: ` +
+        `Internal marker leaked to output: "${leakedToken}". ` +
+        `This indicates the formatting pipeline failed to clean up internal tokens. ` +
+        `Check the formatting functions called before ${context}.`
+      );
+    }
+    rx.lastIndex = 0;
+  }
+}
+
+/**
+ * CRITICAL: Final cleanup step for ALL outward-facing formatter functions.
+ * This ensures no internal masking tokens ever reach the rendered output.
+ *
+ * Call this at the end of formatAIContent, formatEquationText, formatTitle, etc.
+ */
+function finalizeFormattedText(text: string, context: string): string {
+  if (!text) return "";
+
+  let out = text;
+
+  // First, run the existing cleanupMaskTokens if any tokens slipped through
+  out = cleanupMaskTokens(out);
+
+  // Then strip any remaining internal artifacts
+  out = stripInternalArtifacts(out);
+
+  // Assert in dev mode to catch issues
+  assertNoInternalArtifacts(out, context);
+
   return out;
 }
 
@@ -69,7 +356,7 @@ function unmaskTokens(input: string, map: Record<string, string>): string {
  * Works for patterns like:
  *   {3/4}*8   → {3/4} × 8
  *   {3/4}*(x) → {3/4} × (x)
- *   2*<<ITALIC_0>> → 2 × *x*
+ *   2*IMASK0IMASK → 2 × *x* (after unmasking)
  *
  * Avoids bullets ("* item") since there's no left operand.
  * NOTE: No lookbehind for Hermes compatibility.
@@ -357,7 +644,7 @@ function removeNewlinesInsideParens(text: string): string {
  *   "... + 5 Right-hand side:" → "... + 5\n\nRight Side:\n"
  *   "equation Left-hand side:" → "equation\n\nLeft Side:\n"
  */
-function isolateLabels(text: string): string {
+export function isolateLabels(text: string): string {
   let result = text;
 
   // STEP 1: Normalize label variants to canonical forms
@@ -384,6 +671,42 @@ function isolateLabels(text: string): string {
   // Clean up leading newlines
   result = result.replace(/^\n+/, '');
   return result;
+}
+
+/**
+ * CRITICAL: Single centralized function for normalizing equation blocks BEFORE extraction.
+ *
+ * This function consolidates all equation-block normalization logic in one place,
+ * preventing the "line break chaos" that occurs when multiple systems compete:
+ * - contentFormatter's newline pipeline
+ * - FormalStepsBox's split/trim/filter
+ * - MathText's multiline handling
+ *
+ * Use this at the START of any equation extraction logic (extractAllEquations, extractEquation).
+ * It preserves structural boundaries (labels, paragraph breaks) while fixing:
+ * - Broken lines inside delimiters: "(x +\n6)" → "(x + 6)"
+ * - Incomplete equation wraps that should be joined
+ * - Label isolation: "equation Right Side:" → "equation\n\nRight Side:\n"
+ *
+ * IMPORTANT: After calling this, split on "\n" but do NOT aggressively filter empty lines
+ * until the point of use. Empty lines may represent intentional boundaries.
+ */
+export function normalizeEquationBlockForExtraction(input: string): string {
+  if (!input) return "";
+
+  let s = normalizeLineBreaks(input);
+
+  // Preserve structural labels as hard boundaries (Left Side / Right Side / etc.)
+  s = isolateLabels(s);
+
+  // Remove accidental wraps inside (), {}, [] so math tokens don't fragment
+  s = removeNewlinesInsideDelimiters(s);
+
+  // Join only truly-broken equation wraps, but don't cross labels/new equations
+  s = joinBrokenEquationLines(s);
+
+  // Finalize to ensure no internal tokens leak through
+  return finalizeFormattedText(s.trim(), "normalizeEquationBlockForExtraction");
 }
 
 /**
@@ -520,9 +843,10 @@ function normalizeAdjacentFractions(text: string): string {
  */
 export function formatTitle(title: string): string {
   if (!title) return "";
-  return normalizeLineBreaks(title)
+  const result = normalizeLineBreaks(title)
     .replace(/\s+/g, ' ')
     .trim();
+  return finalizeFormattedText(result, "formatTitle");
 }
 
 /**
@@ -537,10 +861,15 @@ export function formatEquationText(text: string): string {
 
   let result = text;
 
+  // STEP 0: CRITICAL - Normalize asterisks FIRST before any other processing
+  // This strips markdown emphasis (*x*, **x**), dangling asterisks (x*), and
+  // removes duplicated variables (x x) caused by asterisk corruption
+  result = normalizeAsterisks(result);
+
   // Step 1: Normalize all line break types (Windows, old Mac, Unicode)
   result = normalizeLineBreaks(result);
 
-  // Step 1.5: CRITICAL - Disambiguate asterisks EARLY
+  // Step 1.5: CRITICAL - Disambiguate any remaining asterisks
   // The AI uses * for both multiplication ({3/4}*8) and italics (*x*).
   // This masks italic tokens, converts multiplication * to ×, then unmasks.
   result = disambiguateAsterisks(result);
@@ -585,7 +914,8 @@ export function formatEquationText(text: string): string {
   // Trim
   result = result.trim();
 
-  return result;
+  // CRITICAL: Finalize to strip any leaked internal tokens
+  return finalizeFormattedText(result, "formatEquationText");
 }
 
 /**
@@ -862,11 +1192,16 @@ export function formatAIContent(content: string): string {
 
   let result = content;
 
+  // STEP 0: CRITICAL - Normalize asterisks FIRST before any other processing
+  // This strips markdown emphasis (*x*, **x**), dangling asterisks (x*), and
+  // removes duplicated variables (x x) caused by asterisk corruption
+  result = normalizeAsterisks(result);
+
   // STEP -4: NORMALIZE ALL LINE BREAK TYPES FIRST
   // This ensures consistent handling regardless of source (Windows, Mac, Unicode)
   result = normalizeLineBreaks(result);
 
-  // STEP -3.9: DISAMBIGUATE ASTERISKS EARLY
+  // STEP -3.9: DISAMBIGUATE any remaining ASTERISKS
   // The AI uses * for both multiplication ({3/4}*8) and italics (*x*).
   // This masks italic tokens, converts multiplication * to ×, then unmasks.
   // MUST happen before any italic parsing or fraction masking.
@@ -1208,12 +1543,227 @@ export function formatAIContent(content: string): string {
   // Also remove lines with just a single dash after a proper divider line
   result = result.replace(/([-]{4,})\s*\n\s*-\s*\n/g, '$1\n\n');
 
-  return result;
+  // CRITICAL: Finalize to strip any leaked internal tokens
+  return finalizeFormattedText(result, "formatAIContent");
+}
+
+/**
+ * CRITICAL: Lightweight prose formatter for summary/explanation text.
+ * This function applies essential math formatting (fractions, subscripts, colors)
+ * WITHOUT the aggressive step boundary detection that formatAIContent uses.
+ *
+ * The step boundary detection inserts newlines before keywords like "expand",
+ * "combine", "simplify" which is correct for equation blocks but WRONG for
+ * prose like "We expand each side and combine like terms to simplify."
+ *
+ * @param content - The prose content to format
+ * @returns Formatted content safe for rendering
+ */
+export function formatProseContent(content: string): string {
+  if (!content) return "";
+
+  let result = content;
+
+  // Normalize line breaks
+  result = normalizeLineBreaks(result);
+
+  // Normalize asterisks (strip markdown emphasis)
+  result = normalizeAsterisks(result);
+
+  // Disambiguate remaining asterisks
+  result = disambiguateAsterisks(result);
+
+  // Normalize parenthetical fractions to brace syntax
+  result = normalizeFractionForms(result);
+
+  // Fix unicode fractions and raw notation
+  result = fixRawNotation(result);
+
+  // Fix unclosed subscripts/superscripts
+  result = fixUnclosedNotation(result);
+
+  // Clean up mask tokens
+  result = cleanupMaskTokens(result);
+
+  // Remove LaTeX notation
+  result = result.replace(/\\\[/g, '');
+  result = result.replace(/\\\]/g, '');
+  result = result.replace(/\\\(/g, '');
+  result = result.replace(/\\\)/g, '');
+  result = result.replace(/\\text\{([^}]+)\}/g, '$1');
+  result = result.replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '{$1/$2}');
+  result = result.replace(/\\times/g, '×');
+  result = result.replace(/\\cdot/g, '·');
+  result = result.replace(/\\div/g, '÷');
+
+  // Clean up excessive whitespace (but preserve single newlines for paragraph breaks)
+  result = result.replace(/  +/g, ' ');
+  result = result.replace(/\n{3,}/g, '\n\n');
+
+  // Finalize
+  return finalizeFormattedText(result.trim(), "formatProseContent");
+}
+
+// ============================================================================
+// STEP INTENT INFERENCE: Pedagogical badges for step actions
+// ============================================================================
+
+import type { StepAction, BothSidesOpType, BothSidesOperation } from "../types/homework";
+
+/**
+ * Infer the pedagogical action being performed in a step.
+ * This analyzes the step text (title, content, equation) to determine
+ * what mathematical operation is being performed, enabling UI badges
+ * that help students understand the purpose of each transformation.
+ *
+ * @param text - Combined text from step title, content, and equation
+ * @returns Object with action type and human-friendly label
+ */
+export function inferStepAction(text: string): { action: StepAction; label: string } {
+  const t = (text || "").toLowerCase();
+
+  // Check for final answer indicators first (highest priority)
+  if (/(final answer|therefore|thus|answer:|the answer is|solution is)/.test(t)) {
+    return { action: "final", label: "Final answer" };
+  }
+
+  // Check/verify step
+  if (/(check|verify|plug(ging)? in|substitut(e|ing) back|confirm)/.test(t)) {
+    return { action: "check", label: "Check" };
+  }
+
+  // Distribution/expansion
+  if (/(distribut|expand|foil|multiply out)/.test(t)) {
+    return { action: "distribute", label: "Distribute" };
+  }
+
+  // Combining like terms
+  if (/(combine like terms|collect like terms|group like terms|add like terms)/.test(t)) {
+    return { action: "combine_like_terms", label: "Combine like terms" };
+  }
+
+  // Simplification
+  if (/(simplif|reduce|clean up|cancel)/.test(t)) {
+    return { action: "simplify", label: "Simplify" };
+  }
+
+  // Add/subtract both sides (check both orderings)
+  if (/(add|subtract).*(both sides|each side)|both sides.*(add|subtract)|(adding|subtracting).*(from both|to both)/.test(t)) {
+    return { action: "add_subtract_both_sides", label: "Add/Subtract both sides" };
+  }
+
+  // Multiply/divide both sides (check both orderings)
+  if (/(multiply|divide).*(both sides|each side)|both sides.*(multiply|divide)|(multiplying|dividing).*(both sides)/.test(t)) {
+    return { action: "multiply_divide_both_sides", label: "Multiply/Divide both sides" };
+  }
+
+  // Isolating variable
+  if (/(isolate|solve for|get .* alone|move .* to|rearrange for)/.test(t)) {
+    return { action: "isolate_variable", label: "Isolate variable" };
+  }
+
+  // Factoring
+  if (/(factor|factoring|factor out)/.test(t)) {
+    return { action: "factor", label: "Factor" };
+  }
+
+  // Substitution
+  if (/(substitut|plug in|replace|let .* =)/.test(t)) {
+    return { action: "substitute", label: "Substitute" };
+  }
+
+  // Evaluation/calculation
+  if (/(evaluate|compute|calculate|find the value|work out)/.test(t)) {
+    return { action: "evaluate", label: "Evaluate" };
+  }
+
+  // Default to rewrite for setup/initial steps
+  return { action: "rewrite", label: "Rewrite" };
+}
+
+// ============================================================================
+// BOTH SIDES OPERATION EXTRACTION: Visual feedback for equation balance
+// ============================================================================
+
+/**
+ * Extract "both sides" operation from step text.
+ * Detects patterns like "Add 11 to both sides", "Subtract 3x from both sides",
+ * "Multiply both sides by 2", "Divide both sides by 4".
+ *
+ * This enables visual feedback showing the operation applied equally,
+ * e.g., "+ 11 = + 11" displayed between equations.
+ *
+ * @param text - Combined text from step title, content, and equation
+ * @returns BothSidesOperation if detected, undefined otherwise
+ */
+export function extractBothSidesOp(text: string): BothSidesOperation | undefined {
+  const t = (text || "").toLowerCase();
+
+  // Pattern 1: "add X to both sides" or "adding X to both sides"
+  // Captures: numbers, fractions {1/2}, variables *x*, expressions like "3x"
+  const addPattern = /(?:add|adding)\s+([^\s]+(?:\s*[^\s]+)?)\s+to\s+(?:both\s+sides|each\s+side)/i;
+  const addMatch = text.match(addPattern);
+  if (addMatch) {
+    return { type: "add", value: cleanOperandValue(addMatch[1]) };
+  }
+
+  // Pattern 2: "subtract X from both sides" or "subtracting X from both sides"
+  const subtractPattern = /(?:subtract|subtracting)\s+([^\s]+(?:\s*[^\s]+)?)\s+from\s+(?:both\s+sides|each\s+side)/i;
+  const subtractMatch = text.match(subtractPattern);
+  if (subtractMatch) {
+    return { type: "subtract", value: cleanOperandValue(subtractMatch[1]) };
+  }
+
+  // Pattern 3: "multiply both sides by X" or "multiplying both sides by X"
+  const multiplyPattern = /(?:multiply|multiplying)\s+(?:both\s+sides|each\s+side)\s+by\s+([^\s.,]+(?:\s*[^\s.,]+)?)/i;
+  const multiplyMatch = text.match(multiplyPattern);
+  if (multiplyMatch) {
+    return { type: "multiply", value: cleanOperandValue(multiplyMatch[1]) };
+  }
+
+  // Pattern 4: "divide both sides by X" or "dividing both sides by X"
+  const dividePattern = /(?:divide|dividing)\s+(?:both\s+sides|each\s+side)\s+by\s+([^\s.,]+(?:\s*[^\s.,]+)?)/i;
+  const divideMatch = text.match(dividePattern);
+  if (divideMatch) {
+    return { type: "divide", value: cleanOperandValue(divideMatch[1]) };
+  }
+
+  // Pattern 5: Inverted order - "both sides + X" or "X added to both sides"
+  const addedPattern = /([^\s]+)\s+(?:added|is\s+added)\s+to\s+(?:both\s+sides|each\s+side)/i;
+  const addedMatch = text.match(addedPattern);
+  if (addedMatch) {
+    return { type: "add", value: cleanOperandValue(addedMatch[1]) };
+  }
+
+  // Pattern 6: Inverted - "X subtracted from both sides"
+  const subtractedPattern = /([^\s]+)\s+(?:subtracted|is\s+subtracted)\s+from\s+(?:both\s+sides|each\s+side)/i;
+  const subtractedMatch = text.match(subtractedPattern);
+  if (subtractedMatch) {
+    return { type: "subtract", value: cleanOperandValue(subtractedMatch[1]) };
+  }
+
+  return undefined;
+}
+
+/**
+ * Clean up the operand value extracted from text.
+ * Handles removing trailing punctuation, normalizing whitespace, etc.
+ */
+function cleanOperandValue(value: string): string {
+  let cleaned = value.trim();
+  // Remove trailing punctuation
+  cleaned = cleaned.replace(/[.,;:]+$/, "");
+  // Normalize whitespace
+  cleaned = cleaned.replace(/\s+/g, " ");
+  return cleaned;
 }
 
 /**
  * Formats an entire solution object, processing all step content and final answer
  * CRITICAL: Uses formatTitle for step titles to ensure no line breaks
+ * CRITICAL: Applies consistent variable highlighting across all steps
+ * CRITICAL: Infers step action for pedagogical badges
+ * CRITICAL: Extracts both-sides operations for visual balance feedback
  */
 export function formatSolution(solution: {
   problem: string;
@@ -1227,24 +1777,148 @@ export function formatSolution(solution: {
     explanation?: string
   }>;
   finalAnswer: string | { parts: string[] };
-}): typeof solution {
+}): typeof solution & { steps: Array<{ action?: string; actionLabel?: string; bothSidesOp?: BothSidesOperation }> } {
+  // STEP 1: Build color map from ALL text in solution (for consistent coloring)
+  const allText = [
+    solution.problem,
+    ...solution.steps.flatMap(s => [s.equation, s.rawEquation, s.content, s.summary, s.explanation]),
+    typeof solution.finalAnswer === 'string'
+      ? solution.finalAnswer
+      : solution.finalAnswer.parts.join(' ')
+  ].filter(Boolean).join(' ');
+
+  const colorMap = buildVarColorMap(allText);
+
+  // STEP 2: Format and apply colors to all fields
+  // Use formatAIContent for equations (needs step boundary detection)
+  const applyFormat = (text: string | undefined): string | undefined => {
+    if (!text) return undefined;
+    const formatted = formatAIContent(text);
+    return applyVarColors(formatted, colorMap);
+  };
+
+  // CRITICAL FIX: Use formatProseContent for summary/explanation
+  // This avoids the aggressive step boundary detection that inserts newlines
+  // before keywords like "expand", "combine", "simplify" which breaks prose
+  const applyProseFormat = (text: string | undefined): string | undefined => {
+    if (!text) return undefined;
+    const formatted = formatProseContent(text);
+    return applyVarColors(formatted, colorMap);
+  };
+
   return {
-    problem: formatAIContent(solution.problem),
-    steps: solution.steps.map(step => ({
-      ...step,
-      title: formatTitle(step.title), // Use formatTitle to ensure no line breaks
-      equation: step.equation ? formatAIContent(step.equation) : undefined,
-      rawEquation: step.rawEquation, // Preserve raw equation - DO NOT format
-      content: step.content ? formatAIContent(step.content) : undefined,
-      summary: step.summary ? formatAIContent(step.summary) : undefined,
-      explanation: step.explanation ? formatAIContent(step.explanation) : undefined,
-    })),
+    problem: applyFormat(solution.problem) ?? '',
+    steps: solution.steps.map((step, index) => {
+      // STEP 3: Infer step action from combined text (title + content + equation)
+      const signalText = [step.title, step.content, step.equation].filter(Boolean).join('\n');
+      const { action, label } = inferStepAction(signalText);
+
+      // For the last step, prefer "final" action if not already detected
+      const isLastStep = index === solution.steps.length - 1;
+      const finalAction = isLastStep && action === "rewrite" ? "final" : action;
+      const finalLabel = isLastStep && action === "rewrite" ? "Final answer" : label;
+
+      // STEP 4: Extract both-sides operation for visual balance feedback
+      const bothSidesOp = extractBothSidesOp(signalText);
+
+      return {
+        ...step,
+        title: formatTitle(step.title), // Titles don't get variable colors (too short)
+        equation: applyFormat(step.equation),
+        rawEquation: step.rawEquation, // Preserve raw equation - DO NOT format or colorize
+        content: applyFormat(step.content),
+        summary: applyProseFormat(step.summary), // CRITICAL: Use prose formatter for summaries
+        explanation: applyProseFormat(step.explanation), // CRITICAL: Use prose formatter for explanations
+        action: finalAction,
+        actionLabel: finalLabel,
+        bothSidesOp,
+      };
+    }),
     finalAnswer: typeof solution.finalAnswer === 'string'
-      ? formatAIContent(solution.finalAnswer)
+      ? applyFormat(solution.finalAnswer) ?? ''
       : {
-          parts: solution.finalAnswer.parts.map(part => formatAIContent(part))
+          parts: solution.finalAnswer.parts.map(part => applyFormat(part) ?? '')
         },
   };
+}
+
+// ============================================================================
+// CANONICAL ENTRYPOINT: formatForMathText (Recommendation 8)
+// ============================================================================
+
+/**
+ * CRITICAL: Single canonical entrypoint for formatting text that will be rendered in MathText.
+ *
+ * This function establishes the "MathText input contract" - any text passed to MathText
+ * should go through this function first, ensuring:
+ * 1. Consistent formatting across all render paths
+ * 2. No duplicated formatting between contentFormatter and MathText
+ * 3. All internal markers are stripped (finalized)
+ * 4. The output is branded as FormattedMathString
+ *
+ * @param input - The raw text to format
+ * @param context - A debug context string (e.g., "step:1:equation") for error tracking
+ * @returns FormattedMathString - Text safe to render in MathText without further processing
+ */
+export function formatForMathText(input: string, context = "unknown"): FormattedMathString {
+  let s = input ?? "";
+
+  // Empty strings are already "formatted"
+  if (!s.trim()) {
+    return s as FormattedMathString;
+  }
+
+  // Apply the full content formatting pipeline
+  // formatAIContent is our top-level content normalizer that handles:
+  // - Line break normalization
+  // - Label isolation
+  // - Fraction normalization
+  // - Asterisk disambiguation
+  // - List item formatting
+  // - And calls finalizeFormattedText at the end
+  s = formatAIContent(s);
+
+  // At this point, s has been through the complete pipeline and finalized.
+  // The finalizeFormattedText call inside formatAIContent ensures no internal
+  // markers leak through.
+
+  return s as FormattedMathString;
+}
+
+/**
+ * Format text specifically for title display (single-line, no breaks).
+ * Returns a FormattedMathString suitable for MathText in "title" mode.
+ */
+export function formatTitleForMathText(input: string, context = "unknown"): FormattedMathString {
+  const s = formatTitle(input ?? "");
+  return s as FormattedMathString;
+}
+
+/**
+ * Format text specifically for prose display (collapsed newlines).
+ * Returns a FormattedMathString suitable for MathText in "prose" mode.
+ */
+export function formatProseForMathText(input: string, context = "unknown"): FormattedMathString {
+  let s = input ?? "";
+  if (!s.trim()) {
+    return s as FormattedMathString;
+  }
+
+  // For prose, we want newlines collapsed to spaces
+  s = normalizeLineBreaks(s);
+  s = s.replace(/\s*\n+\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  s = finalizeFormattedText(s, `formatProseForMathText:${context}`);
+
+  return s as FormattedMathString;
+}
+
+/**
+ * Format text specifically for equation display (preserves structure).
+ * Returns a FormattedMathString suitable for MathText in "equation" mode.
+ */
+export function formatEquationForMathText(input: string, context = "unknown"): FormattedMathString {
+  const s = formatEquationText(input ?? "");
+  return s as FormattedMathString;
 }
 
 /**
@@ -1266,15 +1940,17 @@ export function preprocessMathContent(text: string, mode: MathRenderMode): strin
 
   if (mode === "title") {
     // Titles should NEVER have line breaks
-    return result.replace(/\s+/g, ' ').trim();
+    result = result.replace(/\s+/g, ' ').trim();
+    return finalizeFormattedText(result, "preprocessMathContent:title");
   }
 
   if (mode === "prose") {
     // Prose collapses newlines to spaces
-    return result
+    result = result
       .replace(/\s*\n+\s*/g, ' ')
       .replace(/\s{2,}/g, ' ')
       .trim();
+    return finalizeFormattedText(result, "preprocessMathContent:prose");
   }
 
   // For equation mode, apply full equation preprocessing
@@ -1286,5 +1962,166 @@ export function preprocessMathContent(text: string, mode: MathRenderMode): strin
   result = joinBrokenEquationLines(result);
   result = normalizeAdjacentFractions(result);
 
-  return result.trim();
+  return finalizeFormattedText(result.trim(), "preprocessMathContent:equation");
 }
+
+// ============================================================================
+// VARIABLE HIGHLIGHTING: Consistent color assignment across steps
+// ============================================================================
+
+/**
+ * Available colors for variable highlighting.
+ * These are MathText color tag names that render distinctly.
+ */
+const VAR_COLORS = ["blue", "green", "orange", "purple"] as const;
+type VarColor = (typeof VAR_COLORS)[number];
+
+/**
+ * Extract all single-letter variables from text.
+ * Matches patterns like: x, y, m, b, *x*, *y*, etc.
+ * Returns unique variables in order of first appearance.
+ *
+ * @param text - The text to scan for variables
+ * @returns Array of unique single-letter variables (lowercase)
+ */
+function extractSingleLetterVars(text: string): string[] {
+  const seen = new Set<string>();
+  const vars: string[] = [];
+
+  // Pattern 1: Italic variables like *x*, *y*, *m*
+  const italicPattern = /\*([a-zA-Z])\*/g;
+  let match;
+  while ((match = italicPattern.exec(text)) !== null) {
+    const v = match[1].toLowerCase();
+    if (!seen.has(v)) {
+      seen.add(v);
+      vars.push(v);
+    }
+  }
+
+  // Pattern 2: Standalone single letters in math contexts
+  // Look for: letter followed by operator, equals, space+digit, or subscript
+  // Examples: "x = 5", "y + 3", "m_1", "b = 2"
+  // Avoid: words like "a dog", "the", etc.
+  const standalonePattern = /(?:^|[\s=+\-×÷*/(]|:)([a-zA-Z])(?=[\s=+\-×÷*/)\]_^]|$)/g;
+  while ((match = standalonePattern.exec(text)) !== null) {
+    const v = match[1].toLowerCase();
+    // Skip common words/articles that might match
+    if (!seen.has(v) && !["a", "i"].includes(v)) {
+      seen.add(v);
+      vars.push(v);
+    }
+  }
+
+  return vars;
+}
+
+/**
+ * Build a map of variable -> color for consistent highlighting.
+ * Variables are assigned colors in order of first appearance.
+ *
+ * @param allText - Combined text from all steps to scan
+ * @returns Map of variable letter to color name
+ */
+function buildVarColorMap(allText: string): Map<string, VarColor> {
+  const vars = extractSingleLetterVars(allText);
+  const map = new Map<string, VarColor>();
+
+  vars.forEach((v, i) => {
+    // Cycle through colors if more variables than colors
+    map.set(v, VAR_COLORS[i % VAR_COLORS.length]);
+  });
+
+  return map;
+}
+
+/**
+ * Apply consistent color highlighting to variables in text.
+ * Wraps each variable occurrence with the appropriate color tag.
+ *
+ * @param text - The text to colorize
+ * @param colorMap - Map of variable -> color from buildVarColorMap
+ * @returns Text with color tags applied to variables
+ */
+function applyVarColors(text: string, colorMap: Map<string, VarColor>): string {
+  if (colorMap.size === 0) return text;
+
+  let result = text;
+
+  // Process each variable in the color map
+  colorMap.forEach((color, varLetter) => {
+    // Pattern 1: Replace italic variables *x* → [blue:*x*]
+    // But skip if already inside a color tag
+    const italicPattern = new RegExp(
+      `(?<!\\[[a-z]+:)\\*${varLetter}\\*(?![^\\[]*\\])`,
+      "gi"
+    );
+    result = result.replace(italicPattern, `[${color}:*${varLetter}*]`);
+
+    // Pattern 2: Replace standalone variables in equation contexts
+    // Match: (start/operator/space) + letter + (operator/space/end)
+    // But only if not already in a color tag or italic
+    const standalonePattern = new RegExp(
+      `(?<!\\[[a-z]+:[^\\]]*)(?<!\\*)\\b${varLetter}\\b(?!\\*)(?![^\\[]*\\])`,
+      "gi"
+    );
+    result = result.replace(standalonePattern, `[${color}:${varLetter}]`);
+  });
+
+  return result;
+}
+
+// ============================================================================
+// TEST HOOKS: Exported for unit testing (Recommendation 9)
+// ============================================================================
+
+/**
+ * Internal test hooks for unit testing the formatting pipeline.
+ * These expose internal functions that would otherwise be private,
+ * allowing tests to verify specific formatting behaviors.
+ *
+ * USAGE: Import in test files only:
+ * import { __formattingTestHooks__ } from '../contentFormatter';
+ */
+export const __formattingTestHooks__ = {
+  // Internal artifact detection
+  FORMAT_LEAK_REGEXES,
+  stripInternalArtifacts,
+  assertNoInternalArtifacts,
+  finalizeFormattedText,
+  cleanupMaskTokens,
+
+  // Masking operations
+  maskItalicsTokens,
+  unmaskTokens,
+
+  // Equation processing
+  normalizeFractions,
+  normalizeFractionForms,
+  normalizeFractionMultiplication,
+  normalizeAdjacentFractions,
+  fixUnclosedNotation,
+  fixRedundantAnswers,
+
+  // Line break handling
+  isLabelLine,
+  isIncompleteEquationLine,
+  startsWithContinuation,
+  startsNewEquation,
+
+  // List processing
+  forceListItemLineBreaks,
+
+  // Variable highlighting
+  VAR_COLORS,
+  extractSingleLetterVars,
+  buildVarColorMap,
+  applyVarColors,
+
+  // Step action inference
+  inferStepAction,
+
+  // Both sides operation extraction
+  extractBothSidesOp,
+  cleanOperandValue,
+};

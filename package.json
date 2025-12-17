@@ -9,6 +9,7 @@
     "web": "expo start --web",
     "lint": "expo lint",
     "typecheck": "tsc --noEmit",
+    "test:formatter": "bun src/utils/__tests__/contentFormatter.test.ts",
     "testbot": "bun src/testing/testbot-with-fixes.ts",
     "testbot:single": "bun run src/testing/runTestBot.ts --single"
   },
@@ -36,6 +37,7 @@
     "@react-navigation/stack": "^7.1.1",
     "@shopify/flash-list": "1.7.6",
     "@shopify/react-native-skia": "v2.0.3",
+    "@vibecodeapp/sdk": "^0.4.3",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "expo": "53.0.9",
@@ -118,6 +120,7 @@
     "uuid": "^11.1.0",
     "victory-native": "^41.16.2",
     "zeego": "^3.0.6",
+    "zod": "^4.2.0",
     "zustand": "^5.0.4"
   },
   "devDependencies": {

@@ -16,7 +16,13 @@ import { MathText } from "../components/MathText";
 import { FormalStepsBox } from "../components/FormalStepsBox";
 import { colors } from "../utils/designSystem";
 import { responsiveTypography, responsiveSpacing, responsiveElements } from "../utils/responsive";
-import { formatSolution, formatTitle } from "../utils/contentFormatter";
+import { formatSolution, formatTitle, formatForMathText, detectContentKind, formatByKind } from "../utils/contentFormatter";
+import {
+  validateParsedSolution,
+  storeValidationFailure,
+  formatValidationErrorForUI,
+  type ValidatedParsedSolution,
+} from "../utils/solutionSchema";
 
 import { detectSubject, getSubjectFormattingRules } from "../utils/subjectDetection";
 import { detectDifficultyLevel, getGradeAppropriateInstructions } from "../utils/difficultyDetection";
@@ -119,7 +125,8 @@ export default function SolutionScreen({
   }, []);
 
   // Helper function to parse JSON from AI response with better error handling
-  const parseAIResponse = (responseContent: string) => {
+  // Now includes Zod schema validation for strict type checking
+  const parseAIResponse = (responseContent: string): ValidatedParsedSolution => {
     let jsonString = responseContent;
 
     // Try to extract JSON from markdown code blocks
@@ -198,22 +205,32 @@ export default function SolutionScreen({
               steps: JSON.parse(stepsMatch[1]),
               finalAnswer: answerMatch[1].replace(/\\"/g, '"')
             };
-            return reconstructed;
+            parsedSolution = reconstructed;
           }
         } catch (reconstructError) {
           console.log("Failed to reconstruct JSON:", reconstructError);
         }
 
-        throw new Error("Invalid JSON format in AI response");
+        if (!parsedSolution) {
+          throw new Error("Invalid JSON format in AI response");
+        }
       }
     }
 
-    if (!parsedSolution || !parsedSolution.steps || !Array.isArray(parsedSolution.steps)) {
-      console.log("Invalid solution structure:", parsedSolution);
-      throw new Error("AI response missing required fields");
+    // CRITICAL: Schema validation using Zod
+    // Validates structure BEFORE any formatting is attempted
+    const validationResult = validateParsedSolution(parsedSolution);
+
+    if (!validationResult.success) {
+      // Store failure for debugging
+      storeValidationFailure(validationResult);
+
+      // Throw with user-friendly message
+      const errorMessage = formatValidationErrorForUI(validationResult);
+      throw new Error(errorMessage);
     }
 
-    return parsedSolution;
+    return validationResult.data;
   };
 
   // Helper function to verify solution accuracy
@@ -454,6 +471,70 @@ Generate the diagram with mathematically correct dimensions and proper term iden
     }
 
     return processedContent;
+  };
+
+  // Helper types for buildFormattedSolutionFromParsed
+  type ParsedStep = {
+    title: string;
+    equation?: string;
+    content?: string;
+    summary?: string;
+  };
+
+  type ParsedAISolution = {
+    problem: string;
+    steps: ParsedStep[];
+    finalAnswer: any;
+  };
+
+  /**
+   * Centralized helper to build formatted solutions consistently.
+   * CRITICAL: Always preserves rawEquation for FormalStepsBox alignment.
+   * CRITICAL: Uses content-kind routing to prevent math transforms on non-math content.
+   * This ensures both normal and correction paths produce identical step structure.
+   */
+  const buildFormattedSolutionFromParsed = async (
+    parsed: ParsedAISolution
+  ): Promise<HomeworkSolution> => {
+    const steps = await Promise.all(
+      (parsed.steps || []).map(async (step, index) => {
+        const equationProcessed = step.equation
+          ? await processImageGeneration(step.equation)
+          : undefined;
+
+        const contentProcessed = step.content
+          ? await processImageGeneration(step.content)
+          : undefined;
+
+        // Detect content kind for each field to route to appropriate formatter
+        const equationKind = detectContentKind(step.equation);
+        const summaryKind = detectContentKind(step.summary);
+
+        return {
+          id: `step-${index}`,
+          title: formatTitle(step.title),
+          equation: equationProcessed ? formatByKind(equationProcessed, equationKind) : undefined,
+          rawEquation: step.equation, // ALWAYS preserve for FormalStepsBox
+          equationKind,
+          content: contentProcessed,
+          summary: step.summary ? formatByKind(step.summary, summaryKind) : undefined,
+          summaryKind,
+        };
+      })
+    );
+
+    const raw: HomeworkSolution = {
+      problem: parsed.problem,
+      steps,
+      finalAnswer: parsed.finalAnswer,
+    };
+
+    try {
+      return formatSolution(raw);
+    } catch (e) {
+      console.log("Error in formatSolution (fallback to raw):", e);
+      return raw;
+    }
   };
 
   const analyzeTextQuestion = async () => {
@@ -851,12 +932,22 @@ Question: ${questionText}
 - Example WRONG: "For \\alpha = 0.05" - Example CORRECT: "For alpha = 0.05"
 - Example WRONG: "\\frac{1}{2}*x*" - Example CORRECT: "{1/2}*x*"
 
+**CRITICAL: NO MARKDOWN EMPHASIS ASTERISKS**:
+- DO NOT use asterisks for emphasis (no *x*, no *word*, no *token*)
+- Variables must appear as plain letters: x, y, m, b (NOT *x*, *y*, *m*, *b*)
+- Never use * for multiplication. Use implicit multiplication (5x) or × if needed
+- ✓ CORRECT: "x = 5", "2x + 3", "y = mx + b", "{3/4} × 8"
+- ✗ ABSOLUTELY WRONG: "*x* = 5", "2*x* + 3", "*y* = *m**x* + *b*"
+- ✗ WRONG: "{3/4}*8" (using * for multiplication)
+- If you need to show multiplication explicitly, use × (multiplication sign): "5 × x" or just write "5x"
+- This prevents rendering bugs where asterisks appear literally in the UI
+
 {
   "problem": "Restate the FULL problem or question clearly - for multiple choice, include the complete question text",
   "steps": [
     {
       "title": "PLAIN TEXT ONLY - NO asterisks, NO color codes, NO brackets",
-      "equation": "Mathematical work with {fractions/like_this}, *italicized*variables*, [blue:highlighting] for intermediate values, and [red:results]. For algebra, use SEPARATE LINES with blank lines between operations. For lists (A, B, C, D), put EACH item on its own line using newlines.",
+      "equation": "Mathematical work with {fractions/like_this}, plain variables (x, y, m), [blue:highlighting] for intermediate values, and [red:results]. For algebra, use SEPARATE LINES with blank lines between operations. For lists (A, B, C, D), put EACH item on its own line using newlines.",
       "summary": "Plain English explanation - ONE sentence, NO math symbols."
     }
   ],
@@ -950,34 +1041,9 @@ Solving for *N*:
       });
       console.log("============================");
 
-      // Process image generation for each step
-      // CRITICAL: Store rawEquation BEFORE any formatting for FormalStepsBox
-      const stepsWithImages = await Promise.all(
-        parsedSolution.steps.map(async (step: any, index: number) => ({
-          id: `step-${index}`,
-          title: formatTitle(step.title),
-          equation: step.equation ? await processImageGeneration(step.equation) : undefined,
-          rawEquation: step.equation, // Preserve raw equation before formatting
-          content: step.content ? await processImageGeneration(step.content) : undefined,
-          summary: step.summary,
-        }))
-      );
-
-      const rawSolution: HomeworkSolution = {
-        problem: parsedSolution.problem,
-        steps: stepsWithImages,
-        finalAnswer: parsedSolution.finalAnswer,
-      };
-
-      // CRITICAL: Apply post-processing to fix formatting issues
-      let formattedSolution;
-      try {
-        formattedSolution = formatSolution(rawSolution);
-      } catch (formatError) {
-        console.log("Error in formatSolution:", formatError);
-        // Fallback to raw solution if formatting fails
-        formattedSolution = rawSolution;
-      }
+      // Process image generation for each step and build formatted solution
+      // Using centralized helper to ensure rawEquation is always preserved
+      let formattedSolution = await buildFormattedSolutionFromParsed(parsedSolution);
 
       // CRITICAL: Verify solution accuracy before showing to user
       console.log("Verifying solution accuracy...");
@@ -1032,23 +1098,8 @@ DO NOT use "corrected_solution" or any other structure. Use "steps" array as sho
         const correctedContent = correctionCompletion.choices[0]?.message?.content || "";
         const correctedParsed = parseAIResponse(correctedContent);
 
-        const correctedSteps = await Promise.all(
-          correctedParsed.steps.map(async (step: any, index: number) => ({
-            id: `step-${index}`,
-            title: formatTitle(step.title),
-            equation: step.equation ? await processImageGeneration(step.equation) : undefined,
-            content: step.content ? await processImageGeneration(step.content) : undefined,
-            summary: step.summary,
-          }))
-        );
-
-        const correctedRaw: HomeworkSolution = {
-          problem: correctedParsed.problem,
-          steps: correctedSteps,
-          finalAnswer: correctedParsed.finalAnswer,
-        };
-
-        formattedSolution = formatSolution(correctedRaw);
+        // Use centralized helper to ensure rawEquation is preserved in correction path
+        formattedSolution = await buildFormattedSolutionFromParsed(correctedParsed);
         console.log("Solution regenerated with corrections");
       } else {
         console.log("Solution verified as accurate ✓");
@@ -1338,12 +1389,22 @@ Each step MUST have TWO components:
 - Example WRONG: "For \\alpha = 0.05" - Example CORRECT: "For alpha = 0.05"
 - Example WRONG: "\\frac{1}{2}*x*" - Example CORRECT: "{1/2}*x*"
 
+**CRITICAL: NO MARKDOWN EMPHASIS ASTERISKS**:
+- DO NOT use asterisks for emphasis (no *x*, no *word*, no *token*)
+- Variables must appear as plain letters: x, y, m, b (NOT *x*, *y*, *m*, *b*)
+- Never use * for multiplication. Use implicit multiplication (5x) or × if needed
+- ✓ CORRECT: "x = 5", "2x + 3", "y = mx + b", "{3/4} × 8"
+- ✗ ABSOLUTELY WRONG: "*x* = 5", "2*x* + 3", "*y* = *m**x* + *b*"
+- ✗ WRONG: "{3/4}*8" (using * for multiplication)
+- If you need to show multiplication explicitly, use × (multiplication sign): "5 × x" or just write "5x"
+- This prevents rendering bugs where asterisks appear literally in the UI
+
 {
   "problem": "Restate the FULL problem or question clearly - for multiple choice, include the complete question text",
   "steps": [
     {
       "title": "PLAIN TEXT ONLY - NO asterisks, NO color codes, NO brackets",
-      "equation": "Mathematical work with {fractions/like_this}, *italicized*variables*, [blue:highlighting] for intermediate values, and [red:results]. For algebra, use SEPARATE LINES with blank lines between operations. For lists (A, B, C, D), put EACH item on its own line using newlines.",
+      "equation": "Mathematical work with {fractions/like_this}, plain variables (x, y, m), [blue:highlighting] for intermediate values, and [red:results]. For algebra, use SEPARATE LINES with blank lines between operations. For lists (A, B, C, D), put EACH item on its own line using newlines.",
       "summary": "Plain English explanation - ONE sentence, NO math symbols."
     }
   ],
@@ -1445,34 +1506,9 @@ Solving for *N*:
       });
       console.log("============================");
 
-      // Process image generation for each step
-      // CRITICAL: Store rawEquation BEFORE any formatting for FormalStepsBox
-      const stepsWithImages = await Promise.all(
-        parsedSolution.steps.map(async (step: any, index: number) => ({
-          id: `step-${index}`,
-          title: formatTitle(step.title),
-          equation: step.equation ? await processImageGeneration(step.equation) : undefined,
-          rawEquation: step.equation, // Preserve raw equation before formatting
-          content: step.content ? await processImageGeneration(step.content) : undefined,
-          summary: step.summary,
-        }))
-      );
-
-      const rawSolution: HomeworkSolution = {
-        problem: parsedSolution.problem,
-        steps: stepsWithImages,
-        finalAnswer: parsedSolution.finalAnswer,
-      };
-
-      // CRITICAL: Apply post-processing to fix formatting issues
-      let formattedSolution;
-      try {
-        formattedSolution = formatSolution(rawSolution);
-      } catch (formatError) {
-        console.log("Error in formatSolution:", formatError);
-        // Fallback to raw solution if formatting fails
-        formattedSolution = rawSolution;
-      }
+      // Process image generation for each step and build formatted solution
+      // Using centralized helper to ensure rawEquation is always preserved
+      let formattedSolution = await buildFormattedSolutionFromParsed(parsedSolution);
 
       // CRITICAL: Verify solution accuracy before showing to user
       console.log("Verifying solution accuracy...");
@@ -1544,23 +1580,8 @@ DO NOT use "corrected_solution" or any other structure. Use "steps" array as sho
         const correctedContent = correctionCompletion.choices[0]?.message?.content || "";
         const correctedParsed = parseAIResponse(correctedContent);
 
-        const correctedSteps = await Promise.all(
-          correctedParsed.steps.map(async (step: any, index: number) => ({
-            id: `step-${index}`,
-            title: formatTitle(step.title),
-            equation: step.equation ? await processImageGeneration(step.equation) : undefined,
-            content: step.content ? await processImageGeneration(step.content) : undefined,
-            summary: step.summary,
-          }))
-        );
-
-        const correctedRaw: HomeworkSolution = {
-          problem: correctedParsed.problem,
-          steps: correctedSteps,
-          finalAnswer: correctedParsed.finalAnswer,
-        };
-
-        formattedSolution = formatSolution(correctedRaw);
+        // Use centralized helper to ensure rawEquation is preserved in correction path
+        formattedSolution = await buildFormattedSolutionFromParsed(correctedParsed);
         console.log("Solution regenerated with corrections");
       } else {
         console.log("Solution verified as accurate ✓");
@@ -1940,7 +1961,15 @@ Now create a simplified explanation for the problem: ${solution.problem}`;
             </View>
 
             {/* Formal Solution Steps Box - Clean vertical equation display */}
-            {revealedSteps >= (solution?.steps.length || 0) && solution?.steps && (
+            {/* Only show for math-based subjects where equation progression is meaningful */}
+            {revealedSteps >= (solution?.steps.length || 0) && solution?.steps && (() => {
+              const { subject } = detectSubject(solution?.problem || "");
+              const showFormalSteps = [
+                "math", "algebra", "geometry", "calculus", "trigonometry",
+                "physics", "chemistry", "statistics"
+              ].includes(subject);
+              return showFormalSteps;
+            })() && (
               <Animated.View entering={FadeInUp.delay(200).duration(500)}>
                 <FormalStepsBox steps={solution.steps} />
               </Animated.View>

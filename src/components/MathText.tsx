@@ -1,7 +1,63 @@
 import React from "react";
-import { View, Text, ScrollView } from "react-native";
+import { View, Text } from "react-native";
 import { Image } from "expo-image";
 import { typography, colors } from "../utils/designSystem";
+import type { FormattedMathString } from "../utils/contentFormatter";
+
+// ============================================================================
+// RECOMMENDATION 8: MathText Input Contract
+// ============================================================================
+// MathText expects pre-formatted content. The caller should use formatForMathText()
+// or similar functions from contentFormatter.ts before passing content here.
+//
+// To disable legacy inline fixes during migration, set USE_LEGACY_MATHTEXT_FIXES = false.
+// This allows testing the new contract without removing the fallback code.
+const USE_LEGACY_MATHTEXT_FIXES = false;
+
+/**
+ * CRITICAL: Last-resort guard to strip any internal formatting markers before render.
+ * This is a cheap insurance layer - the main formatters should have already cleaned these,
+ * but if anything slipped through, this prevents visible token leakage.
+ *
+ * DO NOT re-run full formatting here - just strip known internal markers.
+ */
+function stripKnownInternalMarkersForRender(s: string): string {
+  return s
+    .replace(/\bIMASK\d+IMASK\b/g, "")       // Italic masking tokens
+    .replace(/\bMASK\d+\b/g, "")              // Generic mask tokens
+    .replace(/\b_MASK\d+_?\b/g, "")           // Underscore-wrapped mask tokens
+    .replace(/\bPLACEHOLDER[_\d]+\b/g, "")    // Placeholder tokens
+    .replace(/XXIMAGEPROTECTED\d*XX/g, "")    // Image protection tokens
+    .replace(/〔PROTECTED\d+〕/g, "")          // Unicode-bracket protected tokens
+    .replace(/\bLIST_BREAK\b/g, "\n\n")       // List break markers → actual breaks
+    .replace(/⟪STEP⟫/g, "\n\n")               // Step markers → actual breaks
+    .replace(/<<ITALIC_\d+>>/g, "")           // Legacy italic tokens
+    .replace(/__FILE_URL_\d+__/g, "");        // File URL placeholders
+}
+
+/**
+ * DEV-only: Detect obvious cases where caller forgot to format content.
+ * In DEV mode: throws an error to enforce the formatting contract.
+ * In PROD mode: silently continues (defensive).
+ *
+ * CRITICAL: This is the render-time enforcement of "format once, render only".
+ * If this throws, the caller passed unformatted content to MathText.
+ */
+function assertFormattedContent(raw: string): void {
+  const isDev = typeof __DEV__ !== "undefined" ? __DEV__ : false;
+  if (!isDev) return;
+
+  // Check for internal markers that should have been stripped by formatForMathText
+  const markerPattern = /\bMASK\d+\b|\bIMASK\d+IMASK\b|\bPLACEHOLDER_|XXIMAGEPROTECTED|LIST_BREAK|⟪STEP⟫|<<ITALIC_\d+>>|__FILE_URL_\d+__/;
+  const match = raw.match(markerPattern);
+  if (match) {
+    throw new Error(
+      `[MathText] FORMATTING CONTRACT VIOLATION: Received un-finalized content. ` +
+      `Internal marker found: "${match[0]}". ` +
+      `Please use formatForMathText() before passing content to MathText.`
+    );
+  }
+}
 
 interface FractionProps {
   numerator: string;
@@ -77,6 +133,37 @@ function processScriptNotation(text: string): Array<{ text: string; type: 'norma
   }
 
   return result;
+}
+
+/**
+ * InlineFraction - Renders a fraction using Unicode fraction slash for inline text flow
+ * This keeps fractions inline with surrounding text, preventing line break issues.
+ * Format: numerator⁄denominator (using U+2044 FRACTION SLASH)
+ */
+export function InlineFraction({ numerator, denominator, size = "medium", textColor = colors.textPrimary, highlighted = false }: FractionProps) {
+  const baseSizeMap = {
+    small: typography.mathSmall.fontSize,
+    medium: typography.mathMedium.fontSize,
+    large: typography.mathLarge.fontSize,
+  };
+  const fontSize = baseSizeMap[size];
+
+  // For simple numeric fractions, use Unicode representation
+  // This keeps the fraction inline with text flow
+  return (
+    <Text
+      style={{
+        fontSize,
+        fontWeight: "600",
+        color: textColor,
+        backgroundColor: highlighted ? "rgba(99, 102, 241, 0.1)" : "transparent",
+        borderRadius: 4,
+        paddingHorizontal: highlighted ? 4 : 0,
+      }}
+    >
+      {numerator}/{denominator}
+    </Text>
+  );
 }
 
 export function Fraction({ numerator, denominator, size = "medium", textColor = colors.textPrimary, highlighted = false }: FractionProps) {
@@ -279,7 +366,11 @@ export function Fraction({ numerator, denominator, size = "medium", textColor = 
 }
 
 interface MathTextProps {
-  children: string;
+  /**
+   * The content to render. Should ideally be a FormattedMathString from formatForMathText(),
+   * but accepts regular strings for backwards compatibility during migration.
+   */
+  children: FormattedMathString | string;
   className?: string;
   size?: "small" | "medium" | "large";
   isOnGreenBackground?: boolean; // Flag to indicate if text is on green background (like final answer card)
@@ -341,77 +432,88 @@ export function MathText({ children, className = "", size = "medium", isOnGreenB
   // Default: equation mode allows multiline, prose mode collapses newlines
   const shouldAllowMultiline = multiline !== undefined ? multiline : mode === "equation";
 
-  // CRITICAL: Apply runtime formatting fixes to handle any content that wasn't properly formatted
-  // This catches issues with existing stored content or AI output that bypassed post-processing
-  let processedChildren = children;
+  // RECOMMENDATION 8: Assert the content contract in dev mode
+  assertFormattedContent(children);
 
-  // CRITICAL: For prose mode, collapse all newlines to spaces FIRST
-  // This prevents summary text from being incorrectly split into multiple lines
-  if (mode === "prose") {
-    processedChildren = processedChildren
-      .replace(/\r\n/g, ' ')    // Windows newlines
-      .replace(/\r/g, ' ')       // Old Mac newlines
-      .replace(/\n/g, ' ')       // Unix newlines
-      .replace(/\u2028/g, ' ')   // Unicode line separator
-      .replace(/\u2029/g, ' ')   // Unicode paragraph separator
-      .replace(/\s+/g, ' ')      // Collapse multiple whitespace
-      .trim();
-  }
+  // CRITICAL: First, strip any internal formatting markers that may have leaked through
+  // This is a last-resort guard to prevent tokens like IMASK, PLACEHOLDER, etc. from rendering
+  let processedChildren = stripKnownInternalMarkersForRender(children);
 
-  // CRITICAL: For equation mode, remove newlines INSIDE delimiters (parentheses, braces, brackets)
-  // This fixes Issue 1: "(x +\n6)" → "(x + 6)"
-  // Must happen BEFORE other processing to ensure expressions stay on single lines
-  if (mode === "equation") {
-    // Stack-based removal of newlines inside delimiters
-    const removeNewlinesInDelimiters = (text: string): string => {
-      const result: string[] = [];
-      let parenDepth = 0;
-      let braceDepth = 0;
-      let bracketDepth = 0;
+  // ============================================================================
+  // LEGACY MATHTEXT FIXES (Recommendation 8)
+  // ============================================================================
+  // These inline fixes duplicate functionality from contentFormatter.ts.
+  // They are gated behind USE_LEGACY_MATHTEXT_FIXES to allow gradual migration.
+  // Once all callers use formatForMathText(), set USE_LEGACY_MATHTEXT_FIXES = false.
 
-      for (let i = 0; i < text.length; i++) {
-        const char = text[i];
-
-        if (char === '(') parenDepth++;
-        else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
-        else if (char === '{') braceDepth++;
-        else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
-        else if (char === '[') bracketDepth++;
-        else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
-
-        // If inside any delimiter and encountering a newline, replace with space
-        if (char === '\n' && (parenDepth + braceDepth + bracketDepth) > 0) {
-          // Skip following whitespace and add single space
-          let j = i + 1;
-          while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
-          const lastChar = result.length > 0 ? result[result.length - 1] : '';
-          if (lastChar !== ' ' && lastChar !== '\t') result.push(' ');
-          i = j - 1;
-        } else {
-          result.push(char);
-        }
-      }
-      return result.join('');
-    };
-
-    processedChildren = removeNewlinesInDelimiters(processedChildren);
-
-    // SEMANTIC LINE BREAKS: Insert line breaks after "=" signs for better equation display
-    // This prevents awkward wrapping in the middle of expressions
-    // Only do this if the equation has multiple "=" signs (chained equation)
-    // Pattern: "a = b = c" becomes "a =\nb =\nc" for controlled line breaks
-    const equalsCount = (processedChildren.match(/=/g) || []).length;
-    if (equalsCount >= 2 && !processedChildren.includes('\n')) {
-      // Insert newline after each "=" except the last one
-      // But only if the content after "=" is substantial (more than just a short result)
-      processedChildren = processedChildren.replace(/\s*=\s*(?=[^=]{10,}=)/g, ' =\n');
+  if (USE_LEGACY_MATHTEXT_FIXES) {
+    // CRITICAL: For prose mode, collapse all newlines to spaces FIRST
+    // This prevents summary text from being incorrectly split into multiple lines
+    if (mode === "prose") {
+      processedChildren = processedChildren
+        .replace(/\r\n/g, ' ')    // Windows newlines
+        .replace(/\r/g, ' ')       // Old Mac newlines
+        .replace(/\n/g, ' ')       // Unix newlines
+        .replace(/\u2028/g, ' ')   // Unicode line separator
+        .replace(/\u2029/g, ' ')   // Unicode paragraph separator
+        .replace(/\s+/g, ' ')      // Collapse multiple whitespace
+        .trim();
     }
-  }
 
-  // SAFETY: Remove any MASK/PLACEHOLDER tokens that leaked through from broken formatting
-  processedChildren = processedChildren.replace(/\b_?MASK\d+_?\b/g, '');
-  processedChildren = processedChildren.replace(/PLACEHOLDER[_\d]+/g, '');
-  processedChildren = processedChildren.replace(/〔PROTECTED\d+〕/g, '');
+    // CRITICAL: For equation mode, remove newlines INSIDE delimiters (parentheses, braces, brackets)
+    // This fixes Issue 1: "(x +\n6)" → "(x + 6)"
+    // Must happen BEFORE other processing to ensure expressions stay on single lines
+    if (mode === "equation") {
+      // Stack-based removal of newlines inside delimiters
+      const removeNewlinesInDelimiters = (text: string): string => {
+        const result: string[] = [];
+        let parenDepth = 0;
+        let braceDepth = 0;
+        let bracketDepth = 0;
+
+        for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+
+          if (char === '(') parenDepth++;
+          else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+          else if (char === '{') braceDepth++;
+          else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+          else if (char === '[') bracketDepth++;
+          else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+
+          // If inside any delimiter and encountering a newline, replace with space
+          if (char === '\n' && (parenDepth + braceDepth + bracketDepth) > 0) {
+            // Skip following whitespace and add single space
+            let j = i + 1;
+            while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
+            const lastChar = result.length > 0 ? result[result.length - 1] : '';
+            if (lastChar !== ' ' && lastChar !== '\t') result.push(' ');
+            i = j - 1;
+          } else {
+            result.push(char);
+          }
+        }
+        return result.join('');
+      };
+
+      processedChildren = removeNewlinesInDelimiters(processedChildren);
+
+      // SEMANTIC LINE BREAKS: Insert line breaks after "=" signs for better equation display
+      // This prevents awkward wrapping in the middle of expressions
+      // Only do this if the equation has multiple "=" signs (chained equation)
+      // Pattern: "a = b = c" becomes "a =\nb =\nc" for controlled line breaks
+      const equalsCount = (processedChildren.match(/=/g) || []).length;
+      if (equalsCount >= 2 && !processedChildren.includes('\n')) {
+        // Insert newline after each "=" except the last one
+        // But only if the content after "=" is substantial (more than just a short result)
+        processedChildren = processedChildren.replace(/\s*=\s*(?=[^=]{10,}=)/g, ' =\n');
+      }
+    }
+
+    // SAFETY: Remove any MASK/PLACEHOLDER tokens that leaked through from broken formatting
+    processedChildren = processedChildren.replace(/\b_?MASK\d+_?\b/g, '');
+    processedChildren = processedChildren.replace(/PLACEHOLDER[_\d]+/g, '');
+    processedChildren = processedChildren.replace(/〔PROTECTED\d+〕/g, '');
 
   // CRITICAL FIX: Handle malformed fraction syntax where AI uses curly braces for grouping instead of fractions
   // Pattern: {expression}/number → (expression)/number (convert to parentheses grouping)
@@ -541,6 +643,8 @@ export function MathText({ children, className = "", size = "medium", isOnGreenB
   processedChildren = processedChildren.replace(/\s*(→|⟶|⇒|⟹|➔|➝|➞|➟)\s*\n\s*/g, ' $1 ');
   // Clean up multiple spaces around arrows
   processedChildren = processedChildren.replace(/\s+(→|⟶|⇒|⟹|➔|➝|➞|➟)\s+/g, ' $1 ');
+
+  } // END if (USE_LEGACY_MATHTEXT_FIXES)
 
   // Extract text color from className if present
   const textColorMatch = className.match(/text-(white|gray-\d+|indigo-\d+|emerald-\d+)/);
@@ -881,19 +985,26 @@ export function MathText({ children, className = "", size = "medium", isOnGreenB
   }
 
   // Single line equation rendering
-  // CRITICAL: Detect if content has complex elements (fractions, images, arrows)
-  // - If YES: Use View-based flex layout for proper alignment of complex elements
-  // - If NO: Use pure Text-based rendering for proper inline text flow
-  const hasComplexElements = groupedParts.some(part =>
-    part.type === "fraction" ||
-    part.type === "fraction-with-text" ||
-    part.type === "image" ||
-    part.type === "arrow"
-  );
+  // CRITICAL: Detect if content has elements that REQUIRE View-based layout
+  // Only images truly require View layout. Fractions, highlighted text, and arrows
+  // can all be rendered inline using Text components for proper text flow.
+  //
+  // MAJOR FIX: The previous logic used View-based flex layout for ANY complex element,
+  // which caused text to break at element boundaries instead of word boundaries.
+  // This led to issues like "x" appearing on one line and the rest on another.
+  //
+  // NEW APPROACH:
+  // - prose mode: ALWAYS use inline Text rendering (fractions show as "2/3" inline)
+  // - equation mode: Use View layout ONLY for images; everything else is Text-based
+  const hasImageContent = groupedParts.some(part => part.type === "image");
 
-  // For simple content (only text and italics), use pure Text rendering
+  // CRITICAL: For prose mode, ALWAYS use inline Text rendering
+  // This prevents the awkward line breaks seen in summaries/explanations
+  const shouldUseInlineRendering = mode === "prose" || !hasImageContent;
+
+  // For prose mode or content without images, use pure Text rendering
   // This allows proper word wrapping and inline flow
-  if (!hasComplexElements) {
+  if (shouldUseInlineRendering) {
     return (
       <Text style={{ ...baseTextStyle, color: defaultTextColor }}>
         {groupedParts.map((part, index) => {
@@ -941,8 +1052,71 @@ export function MathText({ children, className = "", size = "medium", isOnGreenB
             );
           }
 
+          // CRITICAL FIX: Handle fractions inline as "num/den" text
+          // This keeps fractions flowing with surrounding text instead of breaking lines
+          if (part.type === "fraction" && part.numerator && part.denominator) {
+            return (
+              <Text
+                key={index}
+                style={{
+                  fontWeight: "600",
+                }}
+              >
+                {part.numerator}/{part.denominator}
+              </Text>
+            );
+          }
+
+          // CRITICAL FIX: Handle fraction-with-text inline
+          if (part.type === "fraction-with-text") {
+            const grouped = part as any;
+            return (
+              <Text key={index} style={{ fontWeight: "600" }}>
+                {grouped.fraction.numerator}/{grouped.fraction.denominator}{grouped.text}
+              </Text>
+            );
+          }
+
+          // CRITICAL FIX: Handle arrows inline
+          if (part.type === "arrow") {
+            const arrowColor = isOnGreenBackground ? "#ffffff" : "#10b981";
+            return (
+              <Text
+                key={index}
+                style={{
+                  fontWeight: "900",
+                  color: arrowColor,
+                }}
+              >
+                {" → "}
+              </Text>
+            );
+          }
+
           if (part.type === "highlighted") {
-            const scriptParts = processScriptNotation(part.content);
+            // CRITICAL FIX: Check if highlighted content contains a fraction
+            // Render fractions inline as "num/den" to maintain text flow
+            const fractionMatch = part.content.match(/^\{([^}]+)\/([^}]+)\}$/);
+            if (fractionMatch) {
+              return (
+                <Text
+                  key={index}
+                  style={{
+                    color: part.color || defaultTextColor,
+                    fontWeight: "bold",
+                  }}
+                >
+                  {fractionMatch[1].trim()}/{fractionMatch[2].trim()}
+                </Text>
+              );
+            }
+
+            // Handle highlighted content that may contain inline fractions
+            let highlightContent = part.content;
+            // Replace {num/den} with num/den for inline display
+            highlightContent = highlightContent.replace(/\{([^}]+)\/([^}]+)\}/g, "$1/$2");
+
+            const scriptParts = processScriptNotation(highlightContent);
             return (
               <Text
                 key={index}
@@ -1411,29 +1585,12 @@ export function MathText({ children, className = "", size = "medium", isOnGreenB
   // For complex content (fractions, arrows, images), use View-based layout with horizontal scroll
   // CRITICAL: Using flexWrap: 'nowrap' and horizontal scroll prevents mid-expression breaking
   // This keeps "x + 17" together instead of breaking into "x" and "+ 17" on separate lines
-  const hasImageContent = groupedParts.some(part => part.type === "image");
+  // NOTE: This code path is only reached for image content now (shouldUseInlineRendering handles everything else)
 
   // If there are images, use regular layout (images need full width)
-  if (hasImageContent) {
-    return (
-      <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center" }}>
-        {groupedParts.map((part, index) => renderPart(part, index))}
-      </View>
-    );
-  }
-
-  // For pure equations (fractions, arrows, text), use horizontal scroll to prevent breaking
   return (
-    <ScrollView
-      horizontal
-      showsHorizontalScrollIndicator={false}
-      contentContainerStyle={{ alignItems: "center", flexGrow: 1 }}
-      style={{ flexGrow: 0 }}
-      bounces={false}
-    >
-      <View style={{ flexDirection: "row", flexWrap: "nowrap", alignItems: "center" }}>
-        {groupedParts.map((part, index) => renderPart(part, index))}
-      </View>
-    </ScrollView>
+    <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center" }}>
+      {groupedParts.map((part, index) => renderPart(part, index))}
+    </View>
   );
 }

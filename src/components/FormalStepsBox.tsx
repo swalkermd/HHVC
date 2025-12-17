@@ -2,22 +2,305 @@ import React, { useState, useEffect } from "react";
 import { View, Text, Dimensions } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { MathText } from "./MathText";
-import { SolutionStep } from "../types/homework";
+import { SolutionStep, BothSidesOperation } from "../types/homework";
 import {
   responsive,
   responsiveSpacing,
   responsiveTypography,
   isPortrait,
 } from "../utils/responsive";
-import { formatEquationText } from "../utils/contentFormatter";
+import { formatEquationText, normalizeEquationBlockForExtraction, stripMarkdownEmphasis, stripDanglingAsterisks, normalizeAsterisks } from "../utils/contentFormatter";
 
 interface FormalStepsBoxProps {
   steps: SolutionStep[];
 }
 
+// ============================================================================
+// STEP ACTION BADGE COMPONENT
+// ============================================================================
+
 /**
- * Extracts ALL equations from a step's equation field, preserving the full work.
- * For multi-step algebra, we want to show each transformation step.
+ * StepActionBadge - Displays a pedagogical badge indicating what action is being performed.
+ * Helps students understand the purpose of each transformation at a glance.
+ */
+function StepActionBadge({ label }: { label?: string }) {
+  if (!label) return null;
+  return (
+    <View
+      style={{
+        alignSelf: "flex-start",
+        paddingHorizontal: 10,
+        paddingVertical: 4,
+        borderRadius: 999,
+        backgroundColor: "rgba(14, 165, 233, 0.15)", // Light sky blue
+        marginBottom: 6,
+      }}
+    >
+      <Text style={{ fontSize: 11, fontWeight: "600", color: "#0369a1" }}>{label}</Text>
+    </View>
+  );
+}
+
+// ============================================================================
+// BOTH SIDES OPERATION ROW COMPONENT
+// ============================================================================
+
+/**
+ * Map operation types to display symbols.
+ */
+const OP_SYMBOLS: Record<BothSidesOperation["type"], string> = {
+  add: "+",
+  subtract: "−", // Using proper minus sign
+  multiply: "×",
+  divide: "÷",
+};
+
+/**
+ * BothSidesOpRow - Displays the operation applied to both sides of an equation.
+ * Shows a visual row like "+ 11 = + 11" to reinforce equation balance.
+ *
+ * @param op - The both-sides operation to display
+ * @param isPortraitMode - Whether we're in portrait orientation
+ */
+function BothSidesOpRow({
+  op,
+  isPortraitMode,
+}: {
+  op: BothSidesOperation;
+  isPortraitMode: boolean;
+}) {
+  const symbol = OP_SYMBOLS[op.type];
+  const displayValue = `${symbol} ${op.value}`;
+
+  // Responsive sizing
+  const fontSize = isPortraitMode ? 12 : 14;
+  const paddingV = isPortraitMode ? 4 : 6;
+  const marginLeft = isPortraitMode ? 26 : 32; // Align with equation content (after step number)
+
+  return (
+    <View
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "center",
+        marginLeft,
+        marginTop: 4,
+        marginBottom: 4,
+        paddingVertical: paddingV,
+        backgroundColor: "rgba(34, 197, 94, 0.08)", // Very subtle green
+        borderRadius: 8,
+      }}
+    >
+      {/* Left side operation */}
+      <View style={{ flex: 1, alignItems: "flex-end", paddingRight: 8 }}>
+        <MathText size={isPortraitMode ? "small" : "medium"}>
+          {displayValue}
+        </MathText>
+      </View>
+
+      {/* Equals sign */}
+      <Text
+        style={{
+          fontSize,
+          fontWeight: "600",
+          color: "#16a34a", // Green for balance emphasis
+          paddingHorizontal: 4,
+        }}
+      >
+        =
+      </Text>
+
+      {/* Right side operation (same as left) */}
+      <View style={{ flex: 1, alignItems: "flex-start", paddingLeft: 8 }}>
+        <MathText size={isPortraitMode ? "small" : "medium"}>
+          {displayValue}
+        </MathText>
+      </View>
+    </View>
+  );
+}
+
+// ============================================================================
+// EQUATION EXTRACTION HELPERS (Recommendation 6)
+// ============================================================================
+
+/**
+ * Regex to match common label prefixes that appear before equations.
+ * These are stripped before extracting equation candidates.
+ */
+const LABEL_PREFIX_RE =
+  /^(?:left side|right side|lhs|rhs|equation(?: after simplifying(?: both sides)?)?|result|final answer|simplified|original equation|therefore|hence|thus)\s*:\s*/i;
+
+/**
+ * Strip leading label prefix from a line.
+ * Example: "Left Side: 2x + 3 = 7" → "2x + 3 = 7"
+ */
+function stripLeadingLabel(line: string): string {
+  return line.replace(LABEL_PREFIX_RE, "").trim();
+}
+
+/**
+ * CRITICAL FIX 2: Validate equation candidates before adding to display.
+ * Rejects malformed equations that would render as garbage.
+ *
+ * Examples of INVALID equations:
+ *   "4 - 1/2 × x x* +" (ends with operator, has dangling asterisk)
+ *   "x = 7/5 × x*" (has dangling asterisk)
+ *   "... +" (ends with operator)
+ *   "=" (empty sides)
+ *   "x = {7/2} × {2/5} x" (multiplication at end - should be simplified)
+ *   "{5/2}x = {9/2} - 1 {5/2} x" (duplicate term at end)
+ *   "× x x" (duplicate variables from asterisk corruption)
+ *
+ * @param eq - The equation candidate to validate
+ * @returns true if the equation is valid and should be rendered
+ */
+function isValidEquationCandidate(eq: string): boolean {
+  // CRITICAL: Normalize asterisks FIRST to clean up corruption before validation
+  const s = normalizeAsterisks(eq ?? "").trim();
+
+  // Must contain an equals sign
+  if (!s.includes("=")) return false;
+
+  // Reject equations ending with an operator or dangling star
+  if (/[+\-×÷*/]\s*$/.test(s)) return false;
+  if (/\*\s*$/.test(s)) return false;
+
+  // Reject equations with dangling asterisks mid-string (like "× x*")
+  if (/\*(?=\s|[+\-×÷*/=)])/.test(s)) return false;
+
+  // CRITICAL: Reject obvious corruption - duplicated variable tokens like "x x"
+  // This catches patterns like "× x x" from broken "*x*" handling
+  if (/\b([A-Za-z])\s+\1\b/.test(s)) return false;
+
+  // Find the equals sign and check both sides
+  const i = s.indexOf("=");
+  const L = s.slice(0, i).trim();
+  const R = s.slice(i + 1).trim();
+
+  // Reject if either side is empty
+  if (!L || !R) return false;
+
+  // Require something meaningful on the right side (digit, letter, or fraction opening)
+  if (!/[0-9A-Za-z{(]/.test(R)) return false;
+
+  // Reject if right side starts with an operator (incomplete equation)
+  if (/^[+×÷*/]/.test(R)) return false;
+
+  // CRITICAL: Reject equations where the right side ends with "× {fraction} variable"
+  // This pattern indicates an incomplete multiplication that should be simplified
+  // Example: "x = {7/2} × {2/5} x" should be rejected - the answer is {7/5}, not a multiplication
+  if (/×\s*\{[^}]+\}\s*[a-zA-Z]\s*$/.test(R)) return false;
+
+  // CRITICAL: Reject equations with duplicate terms at the end
+  // Example: "{5/2}x = {9/2} - 1 {5/2} x" has "{5/2} x" duplicated
+  // Pattern: If we have both a term like "{5/2}x" on left AND "{5/2} x" at end of right, reject
+  const leftFractionVar = L.match(/\{([^}]+)\}\s*([a-zA-Z])/);
+  const rightEndFractionVar = R.match(/\{([^}]+)\}\s*([a-zA-Z])\s*$/);
+  if (leftFractionVar && rightEndFractionVar) {
+    // If the fraction and variable match, this is a duplicate term
+    if (leftFractionVar[1] === rightEndFractionVar[1] &&
+        leftFractionVar[2].toLowerCase() === rightEndFractionVar[2].toLowerCase()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Extract equation candidates from a single line using deterministic parsing.
+ *
+ * This handles complex cases like:
+ * - "Left Side: 6x - 11 = x + 17" (labeled equations)
+ * - "6x - 15 + 4 → 6x - 11" (arrow-separated transforms, but no '=')
+ * - "A = B → C = D" (multiple equations with arrows)
+ * - Lines with multiple "=" patterns
+ *
+ * Returns an array of equation candidates found in the line.
+ */
+function extractEquationCandidatesFromLine(lineRaw: string): string[] {
+  let line = stripLeadingLabel(lineRaw);
+
+  // If the line contains multiple transforms via arrows, split and process each segment
+  // This handles "6x - 15 + 4 → 6x - 11" or "A = B → C = D"
+  const segments = line
+    .split(/(?:→|->|=>|⟶|⟹)/g)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const candidates: string[] = [];
+
+  for (const seg of segments.length ? segments : [line]) {
+    // Find all "…=…" patterns inside the segment
+    // This handles cases like "Left: 6x - 11 = x + 17  Right: ..." on one line
+    const matches = seg.match(/[^=]+=[^=]+/g);
+    if (!matches) continue;
+
+    for (const m of matches) {
+      const eq = m.trim();
+
+      // Reject obvious garbage - incomplete equations
+      if (eq.startsWith("=") || eq.endsWith("=")) continue;
+
+      const idx = eq.indexOf("=");
+      const L = eq.slice(0, idx).trim();
+      const R = eq.slice(idx + 1).trim();
+
+      if (!L || !R) continue;
+
+      // Require at least some "mathy" content on the right side (digit or letter)
+      if (!/[0-9A-Za-z]/.test(R)) continue;
+
+      candidates.push(eq);
+    }
+  }
+
+  // De-duplicate while preserving order
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of candidates) {
+    const key = c.replace(/\s+/g, " ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
+/**
+ * Post-process normalized equation text for extraction purposes.
+ * This applies extraction-specific cleanup AFTER centralized normalization.
+ *
+ * NOTE: The heavy lifting (joining broken lines, fixing delimiters, label isolation)
+ * is done by normalizeEquationBlockForExtraction from contentFormatter.
+ * This function only does extraction-specific cleanup like stripping color tags.
+ */
+function prepareForExtraction(input: string): string {
+  // Use the centralized normalization first
+  let t = normalizeEquationBlockForExtraction(input);
+
+  // Strip ALL color tags but keep their content (for equation comparison/dedup)
+  t = t.replace(/\[(?:red|blue|green|orange|purple|yellow|teal|indigo|pink):([^\]]+)\]/gi, "$1");
+
+  // NOTE: We no longer strip arrows here - extractEquationCandidatesFromLine uses them
+  // to split transform chains like "A = B → C = D"
+
+  // Normalize horizontal whitespace (but preserve newlines for line splitting)
+  t = t.replace(/[ \t]+/g, " ");
+
+  return t;
+}
+
+/**
+ * Extracts ALL equations from a step's equation field using deterministic parsing.
+ *
+ * This replaces the old heuristic-based approach with robust candidate extraction
+ * that handles:
+ * - Labeled equations: "Left Side: 2x + 3 = 7"
+ * - Arrow-separated transforms: "6x - 15 + 4 → 6x - 11"
+ * - Multiple equations per line
+ * - Equations with any variable (not just x/y)
  *
  * Returns an array of equations found in the step, in order.
  */
@@ -48,228 +331,79 @@ function extractAllEquations(equationText: string | undefined): string[] {
     return [];
   }
 
-  const equations: string[] = [];
-  const lines = equationText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+  // CRITICAL FIX 1: Strip markdown emphasis BEFORE any other processing
+  // This ensures *x* tokens don't corrupt equation extraction
+  let cleanedInput = stripMarkdownEmphasis(equationText);
+  cleanedInput = stripDanglingAsterisks(cleanedInput);
 
-  for (const line of lines) {
-    // Skip lines that are clearly explanatory text
+  // CRITICAL: Use centralized normalization BEFORE splitting into lines
+  const normalized = prepareForExtraction(cleanedInput);
+
+  const equations: string[] = [];
+  const lines = normalized.split("\n");
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    // Skip pure labels that end with colon and have no equation content
+    // But DON'T skip labeled equations - extractEquationCandidatesFromLine handles those
+    if (/^[A-Za-z][A-Za-z ]*:\s*$/.test(line)) continue;
+
+    // Skip lines that are clearly explanatory prose (no equation content)
     const lowerLine = line.toLowerCase();
-    if (lowerLine.endsWith(":") ||
+    if (
+      !line.includes("=") && (
         lowerLine.startsWith("where") ||
         lowerLine.startsWith("since") ||
         lowerLine.startsWith("because") ||
         lowerLine.startsWith("note") ||
         lowerLine.startsWith("this") ||
-        lowerLine.startsWith("add ") ||
-        lowerLine.startsWith("subtract") ||
-        lowerLine.startsWith("multiply") ||
-        lowerLine.startsWith("divide") ||
-        lowerLine.startsWith("distribute") ||
-        lowerLine.startsWith("combine") ||
-        lowerLine.startsWith("simplify") ||
-        lowerLine.startsWith("solve") ||
         lowerLine.startsWith("we ") ||
         lowerLine.startsWith("the ") ||
-        lowerLine.startsWith("let ") ||
-        lowerLine.startsWith("original")) {
+        lowerLine.startsWith("let ")
+      )
+    ) {
       continue;
     }
 
-    // Check if line contains = and looks like math
-    if (line.includes("=")) {
-      // Make sure it has math-like content (numbers, variables, operators)
-      if (/[\d{}*xy]/.test(line)) {
-        // Clean up the line
-        let cleanLine = line;
-
-        // Remove [red:] tags but keep content
-        cleanLine = cleanLine.replace(/\[red:([^\]]+)\]/g, "$1");
-        // Remove [blue:] tags but keep content
-        cleanLine = cleanLine.replace(/\[blue:([^\]]+)\]/g, "$1");
-        // Remove arrows
-        cleanLine = cleanLine.replace(/→/g, "").trim();
-
-        // CRITICAL: Ensure the equation has BOTH sides of the equals sign
-        // Skip lines that start with "=" (incomplete equations)
-        if (cleanLine.startsWith("=")) {
-          continue;
-        }
-
-        // Skip lines that end with "=" (incomplete equations)
-        if (cleanLine.endsWith("=")) {
-          continue;
-        }
-
-        // Validate that there's content on both sides of =
-        const eqIdx = cleanLine.indexOf("=");
-        if (eqIdx > 0 && eqIdx < cleanLine.length - 1) {
-          const leftSide = cleanLine.substring(0, eqIdx).trim();
-          const rightSide = cleanLine.substring(eqIdx + 1).trim();
-
-          // Both sides must have content
-          if (leftSide.length > 0 && rightSide.length > 0) {
-            // Additional validation: right side should have actual mathematical content
-            // Skip if right side is just whitespace or incomplete
-            if (/[\da-zA-Z]/.test(rightSide)) {
-              equations.push(cleanLine);
-            }
-          }
-        }
+    // Use deterministic candidate extraction
+    const candidates = extractEquationCandidatesFromLine(line);
+    for (const c of candidates) {
+      // CRITICAL FIX 2: Clean and validate before adding
+      const cleaned = stripDanglingAsterisks(stripMarkdownEmphasis(c));
+      if (isValidEquationCandidate(cleaned)) {
+        equations.push(cleaned);
       }
     }
   }
 
-  return equations;
+  // Final de-dupe across the full step
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const e of equations) {
+    const key = e.replace(/\s+/g, " ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+
+  return out;
 }
 
 /**
  * Extracts the final/result equation from a step's equation field.
- * Takes a simple approach: find the [red:] tagged answer or the last equation line.
+ *
+ * This returns the "most final" equation - typically the last one in the step,
+ * which is usually the most simplified form. This prevents the classic bug
+ * where an earlier, less-simplified equation is extracted.
  */
 function extractEquation(equationText: string | undefined): string | null {
-  if (!equationText) return null;
+  const all = extractAllEquations(equationText);
+  if (!all.length) return null;
 
-  // CRITICAL: Skip content that contains image markers - these are not equations
-  // [IMAGE NEEDED: ...] and [IMAGE: ...] markers should not be processed as math
-  // Also check for the processed form [IMAGE: description](url)
-  const hasImageMarker = equationText.includes("[IMAGE NEEDED:") ||
-                         equationText.includes("[IMAGE:") ||
-                         /\[IMAGE:[^\]]*\]\([^)]+\)/.test(equationText);
-
-  if (hasImageMarker) {
-    // Check if there's actual equation content AFTER the image marker
-    // Handle both [IMAGE NEEDED: ...] and [IMAGE: ...](url) forms
-    let afterImage = "";
-
-    // Try to find content after [IMAGE: ...](url) form first
-    const processedImageMatch = equationText.match(/\[IMAGE:[^\]]*\]\([^)]+\)/);
-    if (processedImageMatch) {
-      const endIndex = equationText.indexOf(processedImageMatch[0]) + processedImageMatch[0].length;
-      afterImage = equationText.substring(endIndex).trim();
-    } else {
-      // Fall back to [IMAGE NEEDED: ...] form
-      const imageEndIndex = equationText.lastIndexOf("]");
-      if (imageEndIndex !== -1 && imageEndIndex < equationText.length - 1) {
-        afterImage = equationText.substring(imageEndIndex + 1).trim();
-      }
-    }
-
-    if (afterImage && afterImage.includes("=")) {
-      return extractEquation(afterImage);
-    }
-    return null; // Skip entirely if it's just an image marker
-  }
-
-  // Priority 1: Look for [red:...] highlighted final answer
-  const redMatch = equationText.match(/\[red:([^\]]+)\]/);
-  if (redMatch) {
-    const redContent = redMatch[1].trim();
-    if (redContent.includes("=")) {
-      // The red tag contains a full equation - use it directly
-      return redContent;
-    }
-    // The red tag contains just the result value (not a full equation)
-    // Look for pattern: variable = value → [red:result] or variable = value [red:result]
-    // We want to extract "variable = redContent" as the clean equation
-    // Find the equals sign that precedes the red tag
-    const beforeRed = equationText.substring(0, equationText.indexOf("[red:"));
-    const lastEquals = beforeRed.lastIndexOf("=");
-    if (lastEquals !== -1) {
-      // Find the variable name before the equals sign
-      // Work backwards to find the start of the expression
-      let startIndex = lastEquals - 1;
-      while (startIndex > 0 && /[\s]/.test(beforeRed[startIndex])) {
-        startIndex--;
-      }
-      // Now find the start of the variable/expression
-      while (startIndex > 0 && /[a-zA-Z_*{}\d\s]/.test(beforeRed[startIndex - 1])) {
-        startIndex--;
-      }
-      const variablePart = beforeRed.substring(startIndex, lastEquals).trim();
-      if (variablePart) {
-        // Return clean equation: variable = result from red tag
-        return `${variablePart} = ${redContent}`;
-      }
-    }
-  }
-
-  // Priority 2: Find the LAST line that contains "=" and looks like an equation
-  // Split by newlines and work backwards
-  const lines = equationText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
-
-  for (let i = lines.length - 1; i >= 0; i--) {
-    let line = lines[i];
-
-    // Skip lines that are clearly explanatory text
-    const lowerLine = line.toLowerCase();
-    if (lowerLine.endsWith(":") ||
-        lowerLine.startsWith("where") ||
-        lowerLine.startsWith("since") ||
-        lowerLine.startsWith("because") ||
-        lowerLine.startsWith("note") ||
-        lowerLine.startsWith("this") ||
-        lowerLine.startsWith("add ") ||
-        lowerLine.startsWith("subtract") ||
-        lowerLine.startsWith("multiply") ||
-        lowerLine.startsWith("divide") ||
-        lowerLine.startsWith("distribute") ||
-        lowerLine.startsWith("combine") ||
-        lowerLine.startsWith("simplify") ||
-        lowerLine.startsWith("solve") ||
-        lowerLine.startsWith("we ") ||
-        lowerLine.startsWith("the ") ||
-        lowerLine.startsWith("let ")) {
-      continue;
-    }
-
-    // Check if line contains = and looks like math (not just text with = in it)
-    if (line.includes("=")) {
-      // Make sure it has math-like content (numbers, variables, operators)
-      if (/[\d{}*xy]/.test(line)) {
-        // CRITICAL: Skip lines that start with "=" (incomplete equations missing left side)
-        if (line.trim().startsWith("=")) {
-          continue;
-        }
-
-        // CRITICAL: Skip lines that end with "=" (incomplete equations missing right side)
-        if (line.trim().endsWith("=")) {
-          continue;
-        }
-
-        // CRITICAL: If the line has a [red:] tag, extract clean equation
-        // Pattern: variable = ... → [red:result] or variable = ... [red:result]
-        const redTagMatch = line.match(/\[red:([^\]]+)\]/);
-        if (redTagMatch) {
-          const redResult = redTagMatch[1].trim();
-          // Find the part before the red tag
-          const beforeRed = line.substring(0, line.indexOf("[red:")).trim();
-          // Remove trailing arrow if present
-          const cleanBeforeRed = beforeRed.replace(/→\s*$/, "").trim();
-          // Get the variable and equals sign
-          const equalsIndex = cleanBeforeRed.lastIndexOf("=");
-          if (equalsIndex !== -1) {
-            const variablePart = cleanBeforeRed.substring(0, equalsIndex).trim();
-            if (variablePart) {
-              return `${variablePart} = ${redResult}`;
-            }
-          }
-        }
-
-        // Validate both sides exist
-        const eqIdx = line.indexOf("=");
-        if (eqIdx > 0) {
-          const leftSide = line.substring(0, eqIdx).trim();
-          const rightSide = line.substring(eqIdx + 1).trim();
-          // Both sides must have content with actual mathematical values
-          if (leftSide.length > 0 && rightSide.length > 0 && /[\da-zA-Z]/.test(rightSide)) {
-            return line;
-          }
-        }
-      }
-    }
-  }
-
-  return null;
+  // Prefer the last equation (usually the most simplified/final)
+  return all[all.length - 1];
 }
 
 /**
@@ -334,12 +468,24 @@ function splitEquation(equation: string, forPortrait: boolean = false): { left: 
   // 1. The right side contains multiple "=" (chained equations)
   // 2. The right side is too long (will wrap badly)
   // 3. The equation contains complex patterns like √() or long text
+  // 4. The equation contains fractions {num/den} (they render wider than character count suggests)
+  // 5. The equation contains color tags [color:...] (variable-width content)
+  // 6. The equation contains arrows → (need full width for visual flow)
   if (forPortrait) {
     const hasMultipleEquals = right.includes("=");
     const isTooLong = right.length > 25 || left.length > 15;
     const hasComplexPatterns = equation.includes("√") || equation.includes("opposite") || equation.includes("adjacent");
+    // CRITICAL: Fractions render much wider than their character count
+    // e.g., "{2/3}" is 5 chars but renders as a stacked fraction taking more horizontal space
+    const hasFractions = equation.includes("{") && equation.includes("/") && equation.includes("}");
+    // Also check for parenthesized expressions that might be complex
+    const hasComplexParens = /\([^)]{10,}\)/.test(equation);
+    // Color tags indicate highlighted content which may contain complex elements
+    const hasColorTags = /\[(?:red|blue|green|orange|purple|yellow|teal|indigo|pink):/i.test(equation);
+    // Arrows need full width for proper visual flow
+    const hasArrows = equation.includes("→") || equation.includes("->");
 
-    if (hasMultipleEquals || isTooLong || hasComplexPatterns) {
+    if (hasMultipleEquals || isTooLong || hasComplexPatterns || hasFractions || hasComplexParens || hasColorTags || hasArrows) {
       return null; // Don't split - will be rendered as single line
     }
   }
@@ -396,22 +542,65 @@ export function FormalStepsBox({ steps }: FormalStepsBoxProps) {
   // Math text size for equations
   const mathSize: "small" | "medium" | "large" = isPortraitMode ? "small" : "medium";
 
-  // Extract ALL equations from each step to show complete work
-  // This enables "show your work" style display with every algebraic transformation
-  // We'll number them sequentially (1, 2, 3...) regardless of AI step boundaries
-  const rawEquations: { equation: string; left: string; right: string; isSingleLine: boolean }[] = [];
+  // ============================================================================
+  // STEP 7: Deterministic step numbering (Recommendation 7)
+  // ============================================================================
+  // Build a flattened list of display rows, but PRESERVE the original step number
+  // for each row. This prevents "skipped" or "incorrect" step numbers when:
+  // - A step yields multiple equations (all share the same step number)
+  // - A step yields 0 equations (we show prose content instead)
+  // - Equations are deduplicated across steps
+
+  // DEV INVARIANT: Catch invalid steps array early
+  if (typeof __DEV__ !== "undefined" && __DEV__) {
+    if (!Array.isArray(steps)) {
+      console.error("[FormalStepsBox] steps must be an array");
+    }
+    steps.forEach((s, i) => {
+      if (!s) {
+        console.error(`[FormalStepsBox] Missing step at index ${i}`);
+      }
+    });
+  }
+
+  // Define row types for the flattened display list
+  type DisplayRow = {
+    stepNum: number;           // Original step number (1-indexed, stable)
+    type: "equation" | "prose";
+    equation?: string;
+    left?: string;
+    right?: string;
+    isSingleLine?: boolean;
+    proseText?: string;
+    actionLabel?: string;      // Pedagogical badge label for this step
+    isFirstRowOfStep?: boolean; // Whether this is the first row for its step (for badge display)
+    bothSidesOp?: BothSidesOperation; // Operation applied to both sides (for visual feedback)
+  };
+
+  const displayRows: DisplayRow[] = [];
   const seenEquations = new Set<string>(); // Track seen equations to prevent duplicates
+  let lastStepNum = 0; // Track last step number to know when we're on first row of a new step
+  let equationRowCounter = 0; // CRITICAL: Sequential counter for equation row numbering
 
   steps.forEach((step, index) => {
-    // Prefer rawEquation which preserves newlines, fall back to equation/content
-    const rawText = step.rawEquation || step.equation || step.content;
+    // CRITICAL: displayStepNumber is STABLE and deterministic
+    const displayStepNumber = index + 1;
+    const stepActionLabel = step.actionLabel;
+    const stepBothSidesOp = step.bothSidesOp; // Get both-sides operation for this step
+
+    // CRITICAL: Prefer already-formatted content (equation) over raw unformatted text
+    // rawEquation contains unformatted text with potential MASK tokens, LIST_BREAK markers, etc.
+    // Using equation first ensures we operate on post-formatSolution() output
+    const rawText = step.equation || step.content || step.rawEquation;
 
     // Extract ALL equations from this step (for showing complete work)
     const allEqs = extractAllEquations(rawText);
-    console.log(`[FormalStepsBox] Step ${index + 1} found ${allEqs.length} equations:`, allEqs);
+    console.log(`[FormalStepsBox] Step ${displayStepNumber} found ${allEqs.length} equations:`, allEqs);
+
+    let isFirstRow = true; // Track if this is the first row for this step
 
     if (allEqs.length > 0) {
-      // Add all equations from this step
+      // Add all equations from this step, each with SEQUENTIAL row number
       allEqs.forEach((eq) => {
         const cleaned = cleanEquationForDisplay(eq);
 
@@ -438,28 +627,47 @@ export function FormalStepsBox({ steps }: FormalStepsBoxProps) {
         }
         seenEquations.add(normalizedEq);
 
+        // CRITICAL: Increment equation row counter for each new equation row
+        equationRowCounter++;
+
         const split = splitEquation(finalCleaned, isPortraitMode);
 
         if (split) {
-          rawEquations.push({
+          displayRows.push({
+            stepNum: equationRowCounter, // Use sequential row number, not step index
+            type: "equation",
             equation: finalCleaned,
             left: split.left,
             right: split.right,
             isSingleLine: false,
+            actionLabel: isFirstRow ? stepActionLabel : undefined,
+            isFirstRowOfStep: isFirstRow,
+            bothSidesOp: isFirstRow ? stepBothSidesOp : undefined, // Only show on first row
           });
+          isFirstRow = false;
         } else if (finalCleaned.includes("=")) {
-          rawEquations.push({
+          displayRows.push({
+            stepNum: equationRowCounter, // Use sequential row number, not step index
+            type: "equation",
             equation: finalCleaned,
             left: "",
             right: "",
             isSingleLine: true,
+            actionLabel: isFirstRow ? stepActionLabel : undefined,
+            isFirstRowOfStep: isFirstRow,
+            bothSidesOp: isFirstRow ? stepBothSidesOp : undefined, // Only show on first row
           });
+          isFirstRow = false;
+        } else {
+          // Equation didn't have = and wasn't split - decrement counter
+          equationRowCounter--;
         }
       });
     } else {
-      // Fall back to extracting just the final equation if extractAllEquations found nothing
+      // No equations found - fall back to extracting just the final equation
       const extracted = extractEquation(rawText);
-      console.log(`[FormalStepsBox] Step ${index + 1} fallback extracted:`, extracted);
+      console.log(`[FormalStepsBox] Step ${displayStepNumber} fallback extracted:`, extracted);
+
       if (extracted) {
         const cleaned = cleanEquationForDisplay(extracted);
 
@@ -478,40 +686,66 @@ export function FormalStepsBox({ steps }: FormalStepsBoxProps) {
 
         // Skip if we've already seen this equation
         const normalizedEq = finalCleaned.replace(/\s+/g, " ").trim().toLowerCase();
-        if (seenEquations.has(normalizedEq)) {
-          return;
-        }
-        seenEquations.add(normalizedEq);
+        if (!seenEquations.has(normalizedEq)) {
+          seenEquations.add(normalizedEq);
 
-        const split = splitEquation(finalCleaned, isPortraitMode);
+          // CRITICAL: Increment equation row counter for fallback equations too
+          equationRowCounter++;
 
-        if (split) {
-          rawEquations.push({
-            equation: finalCleaned,
-            left: split.left,
-            right: split.right,
-            isSingleLine: false,
-          });
-        } else if (finalCleaned.includes("=")) {
-          rawEquations.push({
-            equation: finalCleaned,
-            left: "",
-            right: "",
-            isSingleLine: true,
+          const split = splitEquation(finalCleaned, isPortraitMode);
+
+          if (split) {
+            displayRows.push({
+              stepNum: equationRowCounter, // Use sequential row number
+              type: "equation",
+              equation: finalCleaned,
+              left: split.left,
+              right: split.right,
+              isSingleLine: false,
+              actionLabel: stepActionLabel,
+              isFirstRowOfStep: true,
+              bothSidesOp: stepBothSidesOp,
+            });
+          } else if (finalCleaned.includes("=")) {
+            displayRows.push({
+              stepNum: equationRowCounter, // Use sequential row number
+              type: "equation",
+              equation: finalCleaned,
+              left: "",
+              right: "",
+              isSingleLine: true,
+              actionLabel: stepActionLabel,
+              isFirstRowOfStep: true,
+              bothSidesOp: stepBothSidesOp,
+            });
+          } else {
+            // Equation didn't have = - decrement counter
+            equationRowCounter--;
+          }
+        }
+      } else {
+        // RECOMMENDATION 7.2: Don't skip steps with no equations
+        // Instead, show prose content to maintain step number continuity
+        const proseContent = step.content || step.explanation || step.summary || "";
+        if (proseContent.trim()) {
+          // CRITICAL: Prose rows still get sequential numbers
+          equationRowCounter++;
+          displayRows.push({
+            stepNum: equationRowCounter, // Use sequential row number
+            type: "prose",
+            proseText: proseContent.trim(),
+            actionLabel: stepActionLabel,
+            isFirstRowOfStep: true,
           });
         }
+        // Note: If there's truly no content, we still don't add a row,
+        // but this is rare and acceptable - the step had nothing to show
       }
     }
   });
 
-  // Now add sequential step numbers (1, 2, 3, 4...)
-  const equations = rawEquations.map((eq, index) => ({
-    ...eq,
-    stepNum: index + 1,
-  }));
-
-  // Don't render if we couldn't extract any equations
-  if (equations.length === 0) {
+  // Don't render if we couldn't extract any displayable content
+  if (displayRows.length === 0) {
     return null;
   }
 
@@ -565,68 +799,105 @@ export function FormalStepsBox({ steps }: FormalStepsBoxProps) {
 
       {/* Equations Container */}
       <View style={{ padding: containerPadding }}>
-        {equations.map((eq, index) => (
+        {displayRows.map((row, index) => (
           <View
             key={index}
             style={{
-              flexDirection: "row",
-              alignItems: eq.isSingleLine ? "flex-start" : "center",
-              marginBottom: index < equations.length - 1 ? equationGap : 0,
+              marginBottom: index < displayRows.length - 1 ? equationGap : 0,
               paddingVertical: equationPaddingV,
             }}
           >
-            {/* Step number indicator */}
+            {/* Action badge - only show on first row of each step */}
+            {row.isFirstRowOfStep && row.actionLabel && (
+              <View style={{ marginLeft: stepNumberSize + stepNumberMargin, marginBottom: 4 }}>
+                <StepActionBadge label={row.actionLabel} />
+              </View>
+            )}
+
+            {/* Row content with step number and equation/prose */}
             <View
               style={{
-                width: stepNumberSize,
-                height: stepNumberSize,
-                borderRadius: stepNumberSize / 2,
-                backgroundColor: "#0ea5e9",
-                alignItems: "center",
-                justifyContent: "center",
-                marginRight: stepNumberMargin,
-                flexShrink: 0,
-                marginTop: eq.isSingleLine ? 2 : 0,
+                flexDirection: "row",
+                alignItems: row.type === "equation" && row.isSingleLine ? "flex-start" : "center",
               }}
             >
-              <Text style={{ fontSize: stepNumberFontSize, fontWeight: "700", color: "#ffffff" }}>
-                {eq.stepNum}
-              </Text>
+              {/* Step number indicator */}
+              <View
+                style={{
+                  width: stepNumberSize,
+                  height: stepNumberSize,
+                  borderRadius: stepNumberSize / 2,
+                  backgroundColor: "#0ea5e9",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  marginRight: stepNumberMargin,
+                  flexShrink: 0,
+                  marginTop: row.type === "equation" && row.isSingleLine ? 2 : 0,
+                }}
+              >
+                <Text style={{ fontSize: stepNumberFontSize, fontWeight: "700", color: "#ffffff" }}>
+                  {row.stepNum}
+                </Text>
+              </View>
+
+              {row.type === "prose" ? (
+                /* Prose content for steps without equations */
+                <View style={{ flex: 1 }}>
+                  <MathText size={mathSize} mode="prose">{row.proseText || ""}</MathText>
+                </View>
+              ) : row.isSingleLine ? (
+                /* Single line equation - render the full equation without split */
+                <View style={{ flex: 1 }}>
+                  <MathText size={mathSize}>{row.equation || ""}</MathText>
+                </View>
+              ) : (
+                /* Split equation with aligned equals sign */
+                <View style={{ flex: 1, flexDirection: "row", alignItems: "flex-start" }}>
+                  {/* Left side of equation - use flexBasis:0 + minWidth:0 to prevent overflow */}
+                  <View style={{
+                    flexGrow: 1,
+                    flexShrink: 1,
+                    flexBasis: 0,
+                    minWidth: 0,
+                    alignItems: "flex-end",
+                    paddingRight: equalsPaddingH
+                  }}>
+                    <MathText size={mathSize}>{row.left || ""}</MathText>
+                  </View>
+
+                  {/* Equals sign - fixed position for alignment */}
+                  <Text
+                    style={{
+                      fontSize: equalsFontSize,
+                      fontWeight: "700",
+                      color: "#0369a1",
+                      width: equalsWidth,
+                      textAlign: "center",
+                      flexShrink: 0,
+                      lineHeight: equalsFontSize * 1.5,
+                    }}
+                  >
+                    =
+                  </Text>
+
+                  {/* Right side of equation - use flexBasis:0 + minWidth:0 to prevent overflow */}
+                  <View style={{
+                    flexGrow: 1,
+                    flexShrink: 1,
+                    flexBasis: 0,
+                    minWidth: 0,
+                    alignItems: "flex-start",
+                    paddingLeft: equalsPaddingH
+                  }}>
+                    <MathText size={mathSize}>{row.right || ""}</MathText>
+                  </View>
+                </View>
+              )}
             </View>
 
-            {eq.isSingleLine ? (
-              /* Single line equation - render the full equation without split */
-              <View style={{ flex: 1 }}>
-                <MathText size={mathSize}>{eq.equation}</MathText>
-              </View>
-            ) : (
-              /* Split equation with aligned equals sign */
-              <View style={{ flex: 1, flexDirection: "row", alignItems: "flex-start" }}>
-                {/* Left side of equation */}
-                <View style={{ flex: 1, alignItems: "flex-end", paddingRight: equalsPaddingH }}>
-                  <MathText size={mathSize}>{eq.left}</MathText>
-                </View>
-
-                {/* Equals sign - fixed position for alignment */}
-                <Text
-                  style={{
-                    fontSize: equalsFontSize,
-                    fontWeight: "700",
-                    color: "#0369a1",
-                    width: equalsWidth,
-                    textAlign: "center",
-                    flexShrink: 0,
-                    lineHeight: equalsFontSize * 1.5,
-                  }}
-                >
-                  =
-                </Text>
-
-                {/* Right side of equation */}
-                <View style={{ flex: 1, alignItems: "flex-start", paddingLeft: equalsPaddingH }}>
-                  <MathText size={mathSize}>{eq.right}</MathText>
-                </View>
-              </View>
+            {/* Both sides operation row - shows what was done to both sides */}
+            {row.isFirstRowOfStep && row.bothSidesOp && (
+              <BothSidesOpRow op={row.bothSidesOp} isPortraitMode={isPortraitMode} />
             )}
           </View>
         ))}
